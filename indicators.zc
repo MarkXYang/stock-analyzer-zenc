@@ -1,0 +1,264 @@
+// Technical indicators and algorithmic recommendation engine for Stock Analyzer
+// Zen C Implementation
+
+import "model.zc";
+import "stdio.h" as c_io;
+
+fn compute_sma(ts: Timeseries*, period: int, ind: IndicatorResult*) {
+    if ts.count <= 0 || period <= 0 {
+        return;
+    }
+
+    for i in 0..ts.count {
+        if i < period - 1 {
+            ind.has_sma20[i] = false;
+            ind.sma20[i] = 0.0;
+        } else {
+            let sum: f64 = 0.0;
+            for j in (i - period + 1)..(i + 1) {
+                sum = sum + ts.candles[j].close;
+            }
+            ind.sma20[i] = sum / (f64)period;
+            ind.has_sma20[i] = true;
+        }
+    }
+
+    if ts.count >= period {
+        ind.latest_sma20 = ind.sma20[ts.count - 1];
+    } else {
+        ind.latest_sma20 = ts.candles[ts.count - 1].close;
+    }
+}
+
+fn compute_ema_series(closes: f64*, count: int, period: int, out_ema: f64*) {
+    if count <= 0 || period <= 0 {
+        return;
+    }
+
+    let alpha: f64 = 2.0 / ((f64)period + 1.0);
+    out_ema[0] = closes[0];
+
+    for i in 1..count {
+        out_ema[i] = (closes[i] * alpha) + (out_ema[i - 1] * (1.0 - alpha));
+    }
+}
+
+fn compute_rsi(ts: Timeseries*, period: int, ind: IndicatorResult*) {
+    let count = ts.count;
+    if count <= 0 {
+        return;
+    }
+
+    if count < period + 1 {
+        for i in 0..count {
+            ind.rsi14[i] = 50.0;
+            ind.has_rsi14[i] = false;
+        }
+        ind.latest_rsi14 = 50.0;
+        return;
+    }
+
+    for i in 0..period {
+        ind.rsi14[i] = 50.0;
+        ind.has_rsi14[i] = false;
+    }
+
+    // First period sum of gains and losses
+    let sum_gain: f64 = 0.0;
+    let sum_loss: f64 = 0.0;
+
+    for i in 1..(period + 1) {
+        let diff = ts.candles[i].close - ts.candles[i - 1].close;
+        if diff > 0.0 {
+            sum_gain = sum_gain + diff;
+        } else {
+            sum_loss = sum_loss + (-diff);
+        }
+    }
+
+    let avg_gain: f64 = sum_gain / (f64)period;
+    let avg_loss: f64 = sum_loss / (f64)period;
+
+    if avg_loss == 0.0 {
+        ind.rsi14[period] = 100.0;
+    } else {
+        let rs = avg_gain / avg_loss;
+        ind.rsi14[period] = 100.0 - (100.0 / (1.0 + rs));
+    }
+    ind.has_rsi14[period] = true;
+
+    // Smoothed RSI for remaining candles
+    for i in (period + 1)..count {
+        let diff = ts.candles[i].close - ts.candles[i - 1].close;
+        let gain: f64 = if diff > 0.0 { diff } else { 0.0 };
+        let loss: f64 = if diff < 0.0 { -diff } else { 0.0 };
+
+        avg_gain = ((avg_gain * ((f64)period - 1.0)) + gain) / (f64)period;
+        avg_loss = ((avg_loss * ((f64)period - 1.0)) + loss) / (f64)period;
+
+        if avg_loss == 0.0 {
+            ind.rsi14[i] = 100.0;
+        } else {
+            let rs = avg_gain / avg_loss;
+            ind.rsi14[i] = 100.0 - (100.0 / (1.0 + rs));
+        }
+        ind.has_rsi14[i] = true;
+    }
+
+    ind.latest_rsi14 = ind.rsi14[count - 1];
+}
+
+fn compute_macd(ts: Timeseries*, ind: IndicatorResult*) {
+    let count = ts.count;
+    if count <= 0 {
+        return;
+    }
+
+    let closes: f64[256];
+    for i in 0..count {
+        closes[i] = ts.candles[i].close;
+    }
+
+    compute_ema_series(&closes[0], count, 12, &ind.ema12[0]);
+    compute_ema_series(&closes[0], count, 26, &ind.ema26[0]);
+
+    ind.latest_ema12 = ind.ema12[count - 1];
+    ind.latest_ema26 = ind.ema26[count - 1];
+
+    for i in 0..count {
+        ind.macd_line[i] = ind.ema12[i] - ind.ema26[i];
+    }
+
+    // 9-period EMA of MACD line as Signal line
+    compute_ema_series(&ind.macd_line[0], count, 9, &ind.macd_signal[0]);
+
+    for i in 0..count {
+        ind.macd_hist[i] = ind.macd_line[i] - ind.macd_signal[i];
+        ind.has_macd[i] = (i >= 26);
+    }
+
+    ind.latest_macd = ind.macd_line[count - 1];
+    ind.latest_macd_signal = ind.macd_signal[count - 1];
+    ind.latest_macd_hist = ind.macd_hist[count - 1];
+}
+
+fn calculate_indicators(ts: Timeseries*, ind: IndicatorResult*) {
+    compute_sma(ts, 20, ind);
+    compute_rsi(ts, 14, ind);
+    compute_macd(ts, ind);
+}
+
+fn evaluate_recommendation(
+    quote: StockQuote*,
+    _ts: Timeseries*,
+    ind: IndicatorResult*,
+    rec: Recommendation*
+) {
+    let score: int = 0;
+    let price = quote.current_price;
+
+    // 1. SMA-20 Trend Analysis (+/- 25 to 40 pts)
+    if price > ind.latest_sma20 {
+        let premium = ((price - ind.latest_sma20) / ind.latest_sma20) * 100.0;
+        if premium > 6.0 {
+            score = score + 35;
+            c_io::snprintf(&rec.sma_detail[0], 128, "Price is +%.1f%% above 20-day SMA ($%.2f). Strong bullish uptrend.", premium, ind.latest_sma20);
+        } else {
+            score = score + 25;
+            c_io::snprintf(&rec.sma_detail[0], 128, "Price is above 20-day SMA ($%.2f). Upward bias intact.", ind.latest_sma20);
+        }
+    } else {
+        let discount = ((ind.latest_sma20 - price) / ind.latest_sma20) * 100.0;
+        if discount > 6.0 {
+            score = score - 35;
+            c_io::snprintf(&rec.sma_detail[0], 128, "Price is -%.1f%% below 20-day SMA ($%.2f). Significant bearish downtrend.", discount, ind.latest_sma20);
+        } else {
+            score = score - 25;
+            c_io::snprintf(&rec.sma_detail[0], 128, "Price is below 20-day SMA ($%.2f). Weak trend posture.", ind.latest_sma20);
+        }
+    }
+
+    // 2. RSI-14 Oscillator (+/- 30 pts)
+    let rsi = ind.latest_rsi14;
+    if rsi < 30.0 {
+        score = score + 30;
+        c_io::snprintf(&rec.rsi_detail[0], 128, "RSI(14) is %.1f (Oversold < 30). High probability mean-reversion rebound zone.", rsi);
+    } else if rsi < 45.0 {
+        score = score + 15;
+        c_io::snprintf(&rec.rsi_detail[0], 128, "RSI(14) is %.1f (Value Zone 30-45). Constructive risk/reward entry.", rsi);
+    } else if rsi > 70.0 {
+        score = score - 30;
+        c_io::snprintf(&rec.rsi_detail[0], 128, "RSI(14) is %.1f (Overbought > 70). Elevated risk of corrective consolidation.", rsi);
+    } else if rsi > 58.0 {
+        score = score - 10;
+        c_io::snprintf(&rec.rsi_detail[0], 128, "RSI(14) is %.1f (Elevated 58-70). Watch for upper exhaustion resistance.", rsi);
+    } else {
+        c_io::snprintf(&rec.rsi_detail[0], 128, "RSI(14) is %.1f (Neutral 45-58). Momentum is balanced.", rsi);
+    }
+
+    // 3. MACD Momentum & Crossover (+/- 25 pts)
+    if ind.latest_macd > ind.latest_macd_signal {
+        if ind.latest_macd_hist > 0.0 {
+            score = score + 25;
+            c_io::snprintf(&rec.macd_detail[0], 128, "MACD (%.2f) > Signal (%.2f). Bullish crossover with positive momentum.", ind.latest_macd, ind.latest_macd_signal);
+        } else {
+            score = score + 15;
+            c_io::snprintf(&rec.macd_detail[0], 128, "MACD (%.2f) > Signal (%.2f). Moderate bullish posture.", ind.latest_macd, ind.latest_macd_signal);
+        }
+    } else {
+        if ind.latest_macd_hist < 0.0 {
+            score = score - 25;
+            c_io::snprintf(&rec.macd_detail[0], 128, "MACD (%.2f) < Signal (%.2f). Bearish crossover with negative histogram.", ind.latest_macd, ind.latest_macd_signal);
+        } else {
+            score = score - 15;
+            c_io::snprintf(&rec.macd_detail[0], 128, "MACD (%.2f) < Signal (%.2f). Weakening momentum.", ind.latest_macd, ind.latest_macd_signal);
+        }
+    }
+
+    // 4. Session Momentum (+/- 15 pts)
+    if quote.change_pct >= 2.0 {
+        score = score + 15;
+        c_io::snprintf(&rec.trend_detail[0], 128, "Session Change: +%.2f%%. Strong institutional buying flow detected.", quote.change_pct);
+    } else if quote.change_pct <= -2.0 {
+        score = score - 15;
+        c_io::snprintf(&rec.trend_detail[0], 128, "Session Change: %.2f%%. Heavy intraday selling pressure.", quote.change_pct);
+    } else if quote.change_pct > 0.0 {
+        score = score + 5;
+        c_io::snprintf(&rec.trend_detail[0], 128, "Session Change: +%.2f%%. Mild positive intraday drift.", quote.change_pct);
+    } else {
+        score = score - 5;
+        c_io::snprintf(&rec.trend_detail[0], 128, "Session Change: %.2f%%. Mild negative intraday drift.", quote.change_pct);
+    }
+
+    // Clamp score to [-100, 100]
+    if score > 100 { score = 100; }
+    if score < -100 { score = -100; }
+    rec.score = score;
+
+    // Calculate confidence (55% to 92%)
+    let abs_score = if score >= 0 { score } else { -score };
+    rec.confidence = 55 + (abs_score * 37 / 100);
+
+    // Assign signal and badge text
+    if score >= 50 {
+        rec.signal = SIGNAL_STRONG_BUY;
+        c_io::snprintf(&rec.badge_text[0], 32, "STRONG BUY");
+        c_io::snprintf(&rec.summary[0], 256, "Highly favorable multi-indicator alignment (+%d/100). Technical momentum, moving average trend, and volume confirm strong bullish continuation.", score);
+    } else if score >= 15 {
+        rec.signal = SIGNAL_BUY;
+        c_io::snprintf(&rec.badge_text[0], 32, "BUY");
+        c_io::snprintf(&rec.summary[0], 256, "Constructive setup (+%d/100). Upward indicators outweigh negative factors, recommending accumulation on minor dips.", score);
+    } else if score <= -50 {
+        rec.signal = SIGNAL_STRONG_SELL;
+        c_io::snprintf(&rec.badge_text[0], 32, "STRONG SELL");
+        c_io::snprintf(&rec.summary[0], 256, "Severe bearish breakdown (%d/100). Moving average failure and negative MACD acceleration suggest aggressive risk reduction / exit.", score);
+    } else if score <= -15 {
+        rec.signal = SIGNAL_SELL;
+        c_io::snprintf(&rec.badge_text[0], 32, "SELL");
+        c_io::snprintf(&rec.summary[0], 256, "Negative technical posture (%d/100). Indicator balance leans bearish; trimming positions or tightening stop-losses recommended.", score);
+    } else {
+        rec.signal = SIGNAL_HOLD;
+        c_io::snprintf(&rec.badge_text[0], 32, "HOLD / NEUTRAL");
+        c_io::snprintf(&rec.summary[0], 256, "Neutral consolidation (%+d/100). Conflicting indicator signals warrant patience until a clearer directional breakout occurs.", score);
+    }
+}

@@ -1,0 +1,93 @@
+// Data models and constants for Stock Analyzer
+// Zen C Implementation
+
+def MAX_CANDLES: int = 256;
+
+def SIGNAL_STRONG_BUY: int = 2;
+def SIGNAL_BUY: int = 1;
+def SIGNAL_HOLD: int = 0;
+def SIGNAL_SELL: int = -1;
+def SIGNAL_STRONG_SELL: int = -2;
+
+struct Candle {
+    timestamp: i64;
+    date_str: char[16];
+    open: f64;
+    high: f64;
+    low: f64;
+    close: f64;
+    volume: f64;
+}
+
+struct StockQuote {
+    symbol: char[32];
+    display_name: char[64];
+    currency: char[8];
+    current_price: f64;
+    prev_close: f64;
+    change: f64;
+    change_pct: f64;
+    day_open: f64;
+    day_high: f64;
+    day_low: f64;
+    volume: f64;
+    avg_volume: f64;
+    pe_ratio: f64;
+    market_cap: f64;
+    is_china: bool;
+    is_us: bool;
+}
+
+struct Timeseries {
+    candles: Candle[256];
+    count: int;
+    min_price: f64;
+    max_price: f64;
+    min_volume: f64;
+    max_volume: f64;
+}
+
+struct IndicatorResult {
+    // 20-day Simple Moving Average
+    sma20: f64[256];
+    has_sma20: bool[256];
+    latest_sma20: f64;
+
+    // 12-day & 26-day Exponential Moving Averages
+    ema12: f64[256];
+    ema26: f64[256];
+    latest_ema12: f64;
+    latest_ema26: f64;
+
+    // 14-day Relative Strength Index
+    rsi14: f64[256];
+    has_rsi14: bool[256];
+    latest_rsi14: f64;
+
+    // MACD (12, 26, 9)
+    macd_line: f64[256];
+    macd_signal: f64[256];
+    macd_hist: f64[256];
+    has_macd: bool[256];
+    latest_macd: f64;
+    latest_macd_signal: f64;
+    latest_macd_hist: f64;
+}
+
+struct Recommendation {
+    signal: int;          // SIGNAL_STRONG_BUY ... SIGNAL_STRONG_SELL
+    score: int;           // -100 to +100
+    confidence: int;      // 0 to 100%
+    badge_text: char[32]; // e.g. "STRONG BUY", "SELL"
+    summary: char[256];
+    sma_detail: char[128];
+    rsi_detail: char[128];
+    macd_detail: char[128];
+    trend_detail: char[128];
+}
+
+struct GeminiAnalysis {
+    has_data: bool;
+    status: char[128];
+    narrative: char[4096];
+}

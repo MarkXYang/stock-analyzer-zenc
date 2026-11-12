@@ -1,0 +1,138 @@
+// Gemini AI Financial Analysis Service
+// Zen C Implementation
+
+import "model.zc";
+import "stdio.h" as c_io;
+import "string.h" as c_str;
+import "stdlib.h" as c_lib;
+
+raw {
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+int zc_call_gemini_api(
+    char *api_key,
+    char *prompt_text,
+    char *out_response,
+    int max_len
+) {
+    if (!api_key || strlen(api_key) == 0) {
+        return 0;
+    }
+
+    char req_path[] = "/tmp/gemini_req_XXXXXX";
+    int fd = mkstemp(req_path);
+    if (fd < 0) return -1;
+    FILE *req_file = fdopen(fd, "w");
+    if (!req_file) return -1;
+
+    // Safely write JSON payload
+    fprintf(req_file, "{\"contents\":[{\"parts\":[{\"text\":\"");
+    for (char *p = prompt_text; *p; p++) {
+        if (*p == '"') fputs("\\\"", req_file);
+        else if (*p == '\\') fputs("\\\\", req_file);
+        else if (*p == '\n') fputs("\\n", req_file);
+        else if (*p == '\r') fputs("\\r", req_file);
+        else if (*p == '\t') fputs("\\t", req_file);
+        else fputc(*p, req_file);
+    }
+    fputs("\"}]}]}\n", req_file);
+    fclose(req_file);
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+        "curl -s -X POST -H 'Content-Type: application/json' -d @%s "
+        "'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s' | "
+        "jq -r 'if .candidates[0].content.parts[0].text then .candidates[0].content.parts[0].text else \"[Gemini API Error] \" + (.error.message // \"Unknown error\") end' 2>/dev/null",
+        req_path, api_key
+    );
+
+    FILE *pipe = popen(cmd, "r");
+    unlink(req_path);
+    if (!pipe) return -1;
+
+    int total = 0;
+    out_response[0] = '\0';
+    char line[512];
+    while (fgets(line, sizeof(line), pipe) && total < max_len - 1) {
+        int l = (int)strlen(line);
+        if (total + l < max_len - 1) {
+            strcat(out_response, line);
+            total += l;
+        } else {
+            break;
+        }
+    }
+    pclose(pipe);
+    return total > 0 ? 1 : -1;
+}
+}
+
+extern fn zc_call_gemini_api(
+    api_key: char*,
+    prompt_text: char*,
+    out_response: char*,
+    max_len: int
+) -> int;
+
+fn generate_gemini_analysis(
+    api_key: char*,
+    quote: StockQuote*,
+    ind: IndicatorResult*,
+    rec: Recommendation*,
+    out_analysis: GeminiAnalysis*
+) {
+    let key: char* = api_key;
+    if key == NULL || key[0] == '\0' {
+        key = c_lib::getenv("GEMINI_API_KEY");
+    }
+
+    if key == NULL || key[0] == '\0' {
+        out_analysis.has_data = false;
+        c_io::snprintf(&out_analysis.status[0], 128, "No API Key (Algorithmic Scorer Active)");
+        c_io::snprintf(
+            &out_analysis.narrative[0],
+            4096,
+            "Gemini AI Narrative Insights (Optional)\n\nThe native Zen C technical indicator engine is actively computing SMA-20, RSI-14, MACD, and generating the algorithmic recommendation above.\n\nTo activate Google Gemini AI Narrative Analysis:\n  1. Enter your Gemini API key in the top header entry, OR\n  2. Launch with environment variable: export GEMINI_API_KEY=\"AIzaSy...\"\n\nOnce connected, Gemini will provide real-time institutional equity commentary, support/resistance level identification, and catalyst risk assessment."
+        );
+        return;
+    }
+
+    // Build comprehensive prompt
+    let prompt: char[2048];
+    c_io::snprintf(
+        &prompt[0],
+        2048,
+        "Act as an expert Wall Street equity research analyst. Analyze %s (%s) based on: Price=%.2f %s (Session Change=%+.2f%%), Range=%.2f-%.2f, 20-Day SMA=%.2f (Delta vs SMA=%+.1f%%), 14-Day RSI=%.1f, MACD=%.2f (Signal=%.2f, Hist=%+.2f), Algorithmic Score=%s (%+d/100, Confidence=%d%%).\nProvide a crisp note in 4 sections: 1. Trend & Momentum Posture; 2. Key Support & Resistance Levels; 3. Catalyst & Risk Factors; 4. Final Trading / Investment Stance (Entry, Stop Loss, Target).",
+        &quote.symbol[0],
+        &quote.display_name[0],
+        quote.current_price,
+        &quote.currency[0],
+        quote.change_pct,
+        quote.day_low,
+        quote.day_high,
+        ind.latest_sma20,
+        ((quote.current_price - ind.latest_sma20) / ind.latest_sma20) * 100.0,
+        ind.latest_rsi14,
+        ind.latest_macd,
+        ind.latest_macd_signal,
+        ind.latest_macd_hist,
+        &rec.badge_text[0],
+        rec.score,
+        rec.confidence
+    );
+
+    let res = zc_call_gemini_api(key, &prompt[0], &out_analysis.narrative[0], 4096);
+    if res > 0 {
+        out_analysis.has_data = true;
+        c_io::snprintf(&out_analysis.status[0], 128, "Gemini 1.5 Flash Analysis Ready");
+    } else {
+        out_analysis.has_data = false;
+        c_io::snprintf(&out_analysis.status[0], 128, "Gemini API Request Failed");
+        if out_analysis.narrative[0] == '\0' {
+            c_io::snprintf(&out_analysis.narrative[0], 4096, "Failed to connect to Google Gemini API. Please check your network connection and API key.");
+        }
+    }
+}

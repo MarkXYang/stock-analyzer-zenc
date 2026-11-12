@@ -1,0 +1,246 @@
+// Data Service for fetching live USA and China stock market data
+// Zen C Implementation
+
+import "model.zc";
+import "stdio.h" as c_io;
+import "string.h" as c_str;
+import "stdlib.h" as c_lib;
+
+raw {
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+FILE *zc_open_stock_stream(char *symbol) {
+    char cmd[1200];
+    snprintf(cmd, sizeof(cmd),
+        "curl -s -L -A 'Mozilla/5.0' 'https://query1.finance.yahoo.com/v8/finance/chart/%s?range=3mo&interval=1d' | jq -r '"
+        ".chart.result[0] | {"
+        "  name: (.meta.shortName // .meta.symbol),"
+        "  currency: (.meta.currency // \"USD\"),"
+        "  price: (.meta.regularMarketPrice // 0),"
+        "  prev_close: (.meta.chartPreviousClose // .meta.regularMarketPrice // 0),"
+        "  timestamps: .timestamp,"
+        "  opens: .indicators.quote[0].open,"
+        "  highs: .indicators.quote[0].high,"
+        "  lows: .indicators.quote[0].low,"
+        "  closes: .indicators.quote[0].close,"
+        "  volumes: .indicators.quote[0].volume"
+        "} | ["
+        "  \"META\", .name, .currency, (.price|tostring), (.prev_close|tostring),"
+        "  (range(0; .timestamps | length) as $i |"
+        "   if .closes[$i] != null and .opens[$i] != null then"
+        "     \"CANDLE \\(.timestamps[$i]) \\(.opens[$i]) \\(.highs[$i]) \\(.lows[$i]) \\(.closes[$i]) \\(.volumes[$i] // 0)\""
+        "   else empty end"
+        "  )"
+        "] | .[]' 2>/dev/null",
+        symbol
+    );
+    return popen(cmd, "r");
+}
+
+void zc_close_stock_stream(FILE *fp) {
+    if (fp) pclose(fp);
+}
+
+void zc_format_candle_date(long t, char *out, int max_len) {
+    time_t raw = (time_t)t;
+    struct tm *info = localtime(&raw);
+    if (info) {
+        strftime(out, max_len, "%m/%d", info);
+    } else {
+        snprintf(out, max_len, "D");
+    }
+}
+}
+
+extern fn zc_open_stock_stream(symbol: char*) -> c_io::FILE*;
+extern fn zc_close_stock_stream(fp: c_io::FILE*);
+extern fn zc_format_candle_date(t: i64, out: char*, max_len: int);
+
+fn sanitize_ticker(input: char*, out_symbol: char*, max_len: int) {
+    let i: int = 0;
+    let j: int = 0;
+
+    // Skip leading whitespace
+    while input[i] == ' ' || input[i] == '\t' || input[i] == '\r' || input[i] == '\n' {
+        i = i + 1;
+    }
+
+    // Copy and capitalize
+    while input[i] != '\0' && input[i] != ' ' && input[i] != '\t' && input[i] != '\r' && input[i] != '\n' && j < max_len - 8 {
+        let ch = input[i];
+        if ch >= 'a' && ch <= 'z' {
+            ch = (char)((int)ch - 32);
+        }
+        out_symbol[j] = ch;
+        j = j + 1;
+        i = i + 1;
+    }
+    out_symbol[j] = '\0';
+
+    // Auto-detect China A-share 6-digit numeric tickers
+    let is_all_digits = true;
+    for k in 0..j {
+        if out_symbol[k] < '0' || out_symbol[k] > '9' {
+            is_all_digits = false;
+        }
+    }
+
+    if is_all_digits && j == 6 {
+        // 60xxxx, 68xxxx -> Shanghai (.SS)
+        // 00xxxx, 30xxxx -> Shenzhen (.SZ)
+        if out_symbol[0] == '6' {
+            out_symbol[6] = '.';
+            out_symbol[7] = 'S';
+            out_symbol[8] = 'S';
+            out_symbol[9] = '\0';
+        } else if out_symbol[0] == '0' || out_symbol[0] == '3' {
+            out_symbol[6] = '.';
+            out_symbol[7] = 'S';
+            out_symbol[8] = 'Z';
+            out_symbol[9] = '\0';
+        }
+    }
+}
+
+fn fetch_stock_data(symbol: char*, quote: StockQuote*, ts: Timeseries*) -> bool {
+    let clean_sym: char[32];
+    sanitize_ticker(symbol, &clean_sym[0], 32);
+    c_str::strncpy(&quote.symbol[0], &clean_sym[0], 31);
+    quote.symbol[31] = '\0';
+
+    // Check if China stock
+    let sym_len = (int)c_str::strlen(&clean_sym[0]);
+    if sym_len > 3 && c_str::strcmp(&clean_sym[sym_len - 3], ".SS") == 0 {
+        quote.is_china = true;
+        quote.is_us = false;
+    } else if sym_len > 3 && c_str::strcmp(&clean_sym[sym_len - 3], ".SZ") == 0 {
+        quote.is_china = true;
+        quote.is_us = false;
+    } else {
+        quote.is_china = false;
+        quote.is_us = true;
+    }
+
+    let fp = zc_open_stock_stream(&clean_sym[0]);
+    if fp == NULL {
+        return false;
+    }
+
+    let line: char[256];
+    let candle_idx: int = 0;
+    let min_p: f64 = 99999999.0;
+    let max_p: f64 = 0.0;
+    let min_v: f64 = 999999999999.0;
+    let max_v: f64 = 0.0;
+
+    let has_meta: bool = false;
+
+    while c_io::fgets(&line[0], 256, fp) != NULL {
+        // Strip newline
+        let llen = (int)c_str::strlen(&line[0]);
+        if llen > 0 && (line[llen - 1] == '\n' || line[llen - 1] == '\r') {
+            line[llen - 1] = '\0';
+            llen = llen - 1;
+        }
+
+        if c_str::strcmp(&line[0], "META") == 0 {
+            // Read name
+            if c_io::fgets(&quote.display_name[0], 64, fp) != NULL {
+                let nlen = (int)c_str::strlen(&quote.display_name[0]);
+                if nlen > 0 && quote.display_name[nlen - 1] == '\n' { quote.display_name[nlen - 1] = '\0'; }
+            }
+            // Read currency
+            if c_io::fgets(&quote.currency[0], 8, fp) != NULL {
+                let clen = (int)c_str::strlen(&quote.currency[0]);
+                if clen > 0 && quote.currency[clen - 1] == '\n' { quote.currency[clen - 1] = '\0'; }
+            }
+            // Read regularMarketPrice
+            let price_buf: char[32];
+            if c_io::fgets(&price_buf[0], 32, fp) != NULL {
+                quote.current_price = c_lib::atof(&price_buf[0]);
+            }
+            // Read chartPreviousClose
+            let prev_buf: char[32];
+            if c_io::fgets(&prev_buf[0], 32, fp) != NULL {
+                quote.prev_close = c_lib::atof(&prev_buf[0]);
+            }
+
+            has_meta = true;
+            continue;
+        }
+
+        if c_str::strncmp(&line[0], "CANDLE ", 7) == 0 && candle_idx < MAX_CANDLES {
+            let t: i64 = 0;
+            let o: f64 = 0.0;
+            let h: f64 = 0.0;
+            let l: f64 = 0.0;
+            let c: f64 = 0.0;
+            let v: f64 = 0.0;
+
+            let parsed = c_io::sscanf(
+                &line[7],
+                "%ld %lf %lf %lf %lf %lf",
+                &t, &o, &h, &l, &c, &v
+            );
+
+            if parsed >= 5 {
+                ts.candles[candle_idx].timestamp = t;
+                ts.candles[candle_idx].open = o;
+                ts.candles[candle_idx].high = h;
+                ts.candles[candle_idx].low = l;
+                ts.candles[candle_idx].close = c;
+                ts.candles[candle_idx].volume = v;
+
+                zc_format_candle_date(t, &ts.candles[candle_idx].date_str[0], 16);
+
+                if l < min_p { min_p = l; }
+                if h > max_p { max_p = h; }
+                if v < min_v { min_v = v; }
+                if v > max_v { max_v = v; }
+
+                candle_idx = candle_idx + 1;
+            }
+        }
+    }
+
+    zc_close_stock_stream(fp);
+
+    ts.count = candle_idx;
+    ts.min_price = min_p;
+    ts.max_price = max_p;
+    ts.min_volume = min_v;
+    ts.max_volume = max_v;
+
+    if !has_meta || candle_idx == 0 {
+        return false;
+    }
+
+    // Set quote metrics
+    let latest = &ts.candles[candle_idx - 1];
+    if quote.current_price == 0.0 {
+        quote.current_price = latest.close;
+    }
+    if quote.prev_close == 0.0 {
+        if candle_idx >= 2 {
+            quote.prev_close = ts.candles[candle_idx - 2].close;
+        } else {
+            quote.prev_close = latest.open;
+        }
+    }
+
+    quote.day_open = latest.open;
+    quote.day_high = latest.high;
+    quote.day_low = latest.low;
+    quote.volume = latest.volume;
+    quote.change = quote.current_price - quote.prev_close;
+    if quote.prev_close > 0.0 {
+        quote.change_pct = (quote.change / quote.prev_close) * 100.0;
+    } else {
+        quote.change_pct = 0.0;
+    }
+
+    return true;
+}

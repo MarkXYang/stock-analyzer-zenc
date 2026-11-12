@@ -1,0 +1,1030 @@
+// Stock Analyzer — Native Desktop Application in Zen C + GTK4 + Cairo + Gemini
+// Supports USA & China Stock Markets, Technical Indicators, and AI Research
+// Build: zc build main.zc -o stock-analyzer
+// Run:   zc run main.zc
+
+//> include: /usr/include/gtk-4.0 /usr/include/glib-2.0 /usr/lib/x86_64-linux-gnu/glib-2.0/include /usr/include/pango-1.0 /usr/include/harfbuzz /usr/include/cairo /usr/include/gdk-pixbuf-2.0 /usr/include/graphene-1.0 /usr/lib/x86_64-linux-gnu/graphene-1.0/include
+//> link: -lgtk-4 -lgio-2.0 -lgobject-2.0 -lglib-2.0 -lcairo -lm
+
+import "gtk/gtk.h" as gtk;
+import "cairo.h" as cairo;
+import "stdio.h" as c_io;
+import "string.h" as c_str;
+import "stdlib.h" as c_lib;
+
+import "model.zc";
+import "indicators.zc";
+import "data_service.zc";
+import "gemini_service.zc";
+
+def PI: f64 = 3.14159265358979323846;
+
+// Global application state
+let g_quote: StockQuote;
+let g_ts: Timeseries;
+let g_ind: IndicatorResult;
+let g_rec: Recommendation;
+let g_analysis: GeminiAnalysis;
+let g_gemini_key: char[128];
+
+let g_hover_idx: int = -1;
+let g_hover_x: f64 = 0.0;
+let g_hover_y: f64 = 0.0;
+
+extern fn gtk_bridge_update_ui(
+    sym: char*,
+    name: char*,
+    curr: char*,
+    price: f64,
+    change: f64,
+    change_pct: f64,
+    open: f64,
+    high: f64,
+    low: f64,
+    vol: f64,
+    badge: char*,
+    score: int,
+    conf: int,
+    signal_type: int,
+    summary: char*,
+    sma_det: char*,
+    rsi_det: char*,
+    macd_det: char*,
+    trend_det: char*,
+    ai_status: char*,
+    ai_text: char*,
+    is_china: int
+);
+
+extern fn gtk_bridge_queue_chart_redraw();
+
+fn refresh_analysis(ticker: char*) {
+    let ok = fetch_stock_data(ticker, &g_quote, &g_ts);
+    if !ok {
+        c_io::printf("Warning: Failed to fetch data for %s\n", ticker);
+        return;
+    }
+
+    calculate_indicators(&g_ts, &g_ind);
+    evaluate_recommendation(&g_quote, &g_ts, &g_ind, &g_rec);
+    generate_gemini_analysis(&g_gemini_key[0], &g_quote, &g_ind, &g_rec, &g_analysis);
+
+    let china_flag = if g_quote.is_china { 1 } else { 0 };
+
+    gtk_bridge_update_ui(
+        &g_quote.symbol[0],
+        &g_quote.display_name[0],
+        &g_quote.currency[0],
+        g_quote.current_price,
+        g_quote.change,
+        g_quote.change_pct,
+        g_quote.day_open,
+        g_quote.day_high,
+        g_quote.day_low,
+        g_quote.volume,
+        &g_rec.badge_text[0],
+        g_rec.score,
+        g_rec.confidence,
+        g_rec.signal,
+        &g_rec.summary[0],
+        &g_rec.sma_detail[0],
+        &g_rec.rsi_detail[0],
+        &g_rec.macd_detail[0],
+        &g_rec.trend_detail[0],
+        &g_analysis.status[0],
+        &g_analysis.narrative[0],
+        china_flag
+    );
+
+    gtk_bridge_queue_chart_redraw();
+}
+
+@export
+fn zc_app_init() {
+    let env_key = c_lib::getenv("GEMINI_API_KEY");
+    if env_key != NULL {
+        c_str::strncpy(&g_gemini_key[0], env_key, 127);
+        g_gemini_key[127] = '\0';
+    } else {
+        g_gemini_key[0] = '\0';
+    }
+    refresh_analysis("AAPL");
+}
+
+@export
+fn zc_search_ticker(ticker: char*) {
+    if ticker != NULL && ticker[0] != '\0' {
+        refresh_analysis(ticker);
+    }
+}
+
+@export
+fn zc_set_api_key(key: char*) {
+    if key != NULL {
+        c_str::strncpy(&g_gemini_key[0], key, 127);
+        g_gemini_key[127] = '\0';
+        // Refresh Gemini analysis with the new key
+        generate_gemini_analysis(&g_gemini_key[0], &g_quote, &g_ind, &g_rec, &g_analysis);
+        let china_flag = if g_quote.is_china { 1 } else { 0 };
+        gtk_bridge_update_ui(
+            &g_quote.symbol[0],
+            &g_quote.display_name[0],
+            &g_quote.currency[0],
+            g_quote.current_price,
+            g_quote.change,
+            g_quote.change_pct,
+            g_quote.day_open,
+            g_quote.day_high,
+            g_quote.day_low,
+            g_quote.volume,
+            &g_rec.badge_text[0],
+            g_rec.score,
+            g_rec.confidence,
+            g_rec.signal,
+            &g_rec.summary[0],
+            &g_rec.sma_detail[0],
+            &g_rec.rsi_detail[0],
+            &g_rec.macd_detail[0],
+            &g_rec.trend_detail[0],
+            &g_analysis.status[0],
+            &g_analysis.narrative[0],
+            china_flag
+        );
+    }
+}
+
+@export
+fn zc_chart_motion(x: f64, y: f64, width: int, _height: int) {
+    if g_ts.count <= 1 {
+        g_hover_idx = -1;
+        return;
+    }
+
+    let left_m: f64 = 55.0;
+    let right_m: f64 = 55.0;
+    let chart_w: f64 = (f64)width - left_m - right_m;
+
+    if x >= left_m && x <= (f64)width - right_m {
+        let rel_x = x - left_m;
+        let step = chart_w / (f64)(g_ts.count - 1);
+        let idx = (int)((rel_x + (step * 0.5)) / step);
+        if idx >= 0 && idx < g_ts.count {
+            g_hover_idx = idx;
+            g_hover_x = left_m + (f64)idx * step;
+            g_hover_y = y;
+            gtk_bridge_queue_chart_redraw();
+            return;
+        }
+    }
+    if g_hover_idx != -1 {
+        g_hover_idx = -1;
+        gtk_bridge_queue_chart_redraw();
+    }
+}
+
+@export
+fn zc_chart_leave() {
+    if g_hover_idx != -1 {
+        g_hover_idx = -1;
+        gtk_bridge_queue_chart_redraw();
+    }
+}
+
+@export
+fn zc_draw_chart(cr: cairo::cairo_t*, width: int, height: int) {
+    let w: f64 = (f64)width;
+    let h: f64 = (f64)height;
+
+    // Background fill (#0f172a)
+    cairo::cairo_set_source_rgb(cr, 0.059, 0.090, 0.165);
+    cairo::cairo_paint(cr);
+
+    let count = g_ts.count;
+    if count < 2 {
+        cairo::cairo_set_source_rgb(cr, 0.58, 0.64, 0.72);
+        cairo::cairo_select_font_face(cr, "Sans", 0, 1);
+        cairo::cairo_set_font_size(cr, 14.0);
+        cairo::cairo_move_to(cr, w * 0.4, h * 0.5);
+        cairo::cairo_show_text(cr, "No chart data available");
+        return;
+    }
+
+    let left_m: f64 = 55.0;
+    let right_m: f64 = 60.0;
+    let top_m: f64 = 30.0;
+    let chart_w: f64 = w - left_m - right_m;
+
+    // Layout partition:
+    // Price Chart: top_m to h * 0.62
+    // Volume Bars: h * 0.65 to h * 0.77
+    // RSI Subplot: h * 0.81 to h - 25.0
+    let price_h: f64 = (h * 0.60) - top_m;
+    let price_bottom: f64 = top_m + price_h;
+
+    let vol_top: f64 = h * 0.64;
+    let vol_h: f64 = h * 0.12;
+    let vol_bottom: f64 = vol_top + vol_h;
+
+    let rsi_top: f64 = h * 0.80;
+    let rsi_h: f64 = h - 25.0 - rsi_top;
+    let rsi_bottom: f64 = rsi_top + rsi_h;
+
+    // Price scaling
+    let min_p = g_ts.min_price;
+    let max_p = g_ts.max_price;
+    if max_p <= min_p {
+        max_p = min_p + 1.0;
+    }
+    let p_padding = (max_p - min_p) * 0.06;
+    let p_min_sc = min_p - p_padding;
+    let p_max_sc = max_p + p_padding;
+    let p_range = p_max_sc - p_min_sc;
+
+    // 1. Draw Price Gridlines & Labels
+    cairo::cairo_select_font_face(cr, "Sans", 0, 0);
+    cairo::cairo_set_font_size(cr, 10.0);
+
+    for step in 0..5 {
+        let frac = (f64)step / 4.0;
+        let gy = price_bottom - frac * price_h;
+        let g_val = p_min_sc + frac * p_range;
+
+        // Gridline
+        cairo::cairo_set_source_rgba(cr, 0.20, 0.27, 0.36, 0.45);
+        cairo::cairo_set_line_width(cr, 0.8);
+        cairo::cairo_move_to(cr, left_m, gy);
+        cairo::cairo_line_to(cr, w - right_m, gy);
+        cairo::cairo_stroke(cr);
+
+        // Price label on right
+        let lbl_buf: char[32];
+        c_io::snprintf(&lbl_buf[0], 32, "%.2f", g_val);
+        cairo::cairo_set_source_rgb(cr, 0.58, 0.64, 0.72);
+        cairo::cairo_move_to(cr, w - right_m + 6.0, gy + 3.5);
+        cairo::cairo_show_text(cr, &lbl_buf[0]);
+    }
+
+    let x_step = chart_w / (f64)(count - 1);
+
+    // 2. Draw Price Line & Gradient Area Fill
+    // Fill path
+    cairo::cairo_new_path(cr);
+    cairo::cairo_move_to(cr, left_m, price_bottom);
+    for i in 0..count {
+        let cx = left_m + (f64)i * x_step;
+        let cy = price_bottom - ((g_ts.candles[i].close - p_min_sc) / p_range) * price_h;
+        cairo::cairo_line_to(cr, cx, cy);
+    }
+    cairo::cairo_line_to(cr, left_m + (f64)(count - 1) * x_step, price_bottom);
+    cairo::cairo_close_path(cr);
+
+    // Cyan area wash
+    cairo::cairo_set_source_rgba(cr, 0.22, 0.74, 0.97, 0.16);
+    cairo::cairo_fill(cr);
+
+    // Price stroke
+    cairo::cairo_new_path(cr);
+    for i in 0..count {
+        let cx = left_m + (f64)i * x_step;
+        let cy = price_bottom - ((g_ts.candles[i].close - p_min_sc) / p_range) * price_h;
+        if i == 0 {
+            cairo::cairo_move_to(cr, cx, cy);
+        } else {
+            cairo::cairo_line_to(cr, cx, cy);
+        }
+    }
+    cairo::cairo_set_source_rgba(cr, 0.22, 0.74, 0.97, 0.95);
+    cairo::cairo_set_line_width(cr, 2.0);
+    cairo::cairo_stroke(cr);
+
+    // 3. Draw 20-day Simple Moving Average (SMA-20 in Amber)
+    let first_sma = true;
+    cairo::cairo_new_path(cr);
+    for i in 0..count {
+        if g_ind.has_sma20[i] {
+            let cx = left_m + (f64)i * x_step;
+            let cy = price_bottom - ((g_ind.sma20[i] - p_min_sc) / p_range) * price_h;
+            if first_sma {
+                cairo::cairo_move_to(cr, cx, cy);
+                first_sma = false;
+            } else {
+                cairo::cairo_line_to(cr, cx, cy);
+            }
+        }
+    }
+    if !first_sma {
+        cairo::cairo_set_source_rgba(cr, 0.96, 0.62, 0.04, 0.95);
+        cairo::cairo_set_line_width(cr, 1.8);
+        cairo::cairo_stroke(cr);
+    }
+
+    // Chart Legends at top left
+    cairo::cairo_select_font_face(cr, "Sans", 0, 1);
+    cairo::cairo_set_font_size(cr, 10.5);
+
+    // Cyan Close Pill
+    cairo::cairo_set_source_rgb(cr, 0.22, 0.74, 0.97);
+    cairo::cairo_arc(cr, left_m + 6.0, top_m - 12.0, 4.0, 0.0, 2.0 * PI);
+    cairo::cairo_fill(cr);
+    cairo::cairo_set_source_rgb(cr, 0.88, 0.91, 0.94);
+    cairo::cairo_move_to(cr, left_m + 14.0, top_m - 8.5);
+    cairo::cairo_show_text(cr, "Close Price");
+
+    // Amber SMA-20 Pill
+    cairo::cairo_set_source_rgb(cr, 0.96, 0.62, 0.04);
+    cairo::cairo_arc(cr, left_m + 95.0, top_m - 12.0, 4.0, 0.0, 2.0 * PI);
+    cairo::cairo_fill(cr);
+    cairo::cairo_set_source_rgb(cr, 0.88, 0.91, 0.94);
+    cairo::cairo_move_to(cr, left_m + 103.0, top_m - 8.5);
+    cairo::cairo_show_text(cr, "SMA-20");
+
+    // 4. Draw Volume Bars
+    let max_v = g_ts.max_volume;
+    if max_v <= 0.0 { max_v = 1.0; }
+    let bar_w = (chart_w / (f64)count) * 0.65;
+    if bar_w < 1.5 { bar_w = 1.5; }
+
+    cairo::cairo_set_source_rgba(cr, 0.20, 0.27, 0.36, 0.45);
+    cairo::cairo_set_line_width(cr, 0.8);
+    cairo::cairo_move_to(cr, left_m, vol_bottom);
+    cairo::cairo_line_to(cr, w - right_m, vol_bottom);
+    cairo::cairo_stroke(cr);
+
+    // Volume caption
+    cairo::cairo_set_source_rgb(cr, 0.58, 0.64, 0.72);
+    cairo::cairo_move_to(cr, left_m + 4.0, vol_top + 10.0);
+    cairo::cairo_show_text(cr, "VOLUME");
+
+    for i in 0..count {
+        let v = g_ts.candles[i].volume;
+        let v_frac = v / max_v;
+        let bh = v_frac * vol_h;
+        let bx = left_m + (f64)i * x_step - (bar_w * 0.5);
+        let by = vol_bottom - bh;
+
+        if g_ts.candles[i].close >= g_ts.candles[i].open {
+            cairo::cairo_set_source_rgba(cr, 0.063, 0.725, 0.506, 0.65); // Emerald Green
+        } else {
+            cairo::cairo_set_source_rgba(cr, 0.937, 0.267, 0.267, 0.65); // Rose Red
+        }
+        cairo::cairo_rectangle(cr, bx, by, bar_w, bh);
+        cairo::cairo_fill(cr);
+    }
+
+    // 5. Draw RSI-14 Oscillator Sub-panel
+    cairo::cairo_set_source_rgba(cr, 0.20, 0.27, 0.36, 0.45);
+    cairo::cairo_set_line_width(cr, 0.8);
+    cairo::cairo_move_to(cr, left_m, rsi_bottom);
+    cairo::cairo_line_to(cr, w - right_m, rsi_bottom);
+    cairo::cairo_stroke(cr);
+
+    // RSI Threshold lines: 70 (Overbought) and 30 (Oversold)
+    let y_rsi_70 = rsi_bottom - (0.70 * rsi_h);
+    let y_rsi_30 = rsi_bottom - (0.30 * rsi_h);
+
+    cairo::cairo_set_source_rgba(cr, 0.937, 0.267, 0.267, 0.4);
+    cairo::cairo_move_to(cr, left_m, y_rsi_70);
+    cairo::cairo_line_to(cr, w - right_m, y_rsi_70);
+    cairo::cairo_stroke(cr);
+
+    cairo::cairo_set_source_rgba(cr, 0.063, 0.725, 0.506, 0.4);
+    cairo::cairo_move_to(cr, left_m, y_rsi_30);
+    cairo::cairo_line_to(cr, w - right_m, y_rsi_30);
+    cairo::cairo_stroke(cr);
+
+    // RSI Labels
+    cairo::cairo_set_source_rgb(cr, 0.75, 0.52, 0.99); // Purple label
+    cairo::cairo_move_to(cr, left_m + 4.0, rsi_top + 10.0);
+    cairo::cairo_show_text(cr, "RSI (14)");
+
+    cairo::cairo_set_source_rgb(cr, 0.58, 0.64, 0.72);
+    cairo::cairo_move_to(cr, w - right_m + 6.0, y_rsi_70 + 3.5);
+    cairo::cairo_show_text(cr, "70 OB");
+    cairo::cairo_move_to(cr, w - right_m + 6.0, y_rsi_30 + 3.5);
+    cairo::cairo_show_text(cr, "30 OS");
+
+    // Draw RSI curve in purple
+    let first_rsi = true;
+    cairo::cairo_new_path(cr);
+    for i in 0..count {
+        if g_ind.has_rsi14[i] {
+            let cx = left_m + (f64)i * x_step;
+            let val = g_ind.rsi14[i];
+            if val < 0.0 { val = 0.0; }
+            if val > 100.0 { val = 100.0; }
+            let cy = rsi_bottom - (val / 100.0) * rsi_h;
+            if first_rsi {
+                cairo::cairo_move_to(cr, cx, cy);
+                first_rsi = false;
+            } else {
+                cairo::cairo_line_to(cr, cx, cy);
+            }
+        }
+    }
+    if !first_rsi {
+        cairo::cairo_set_source_rgba(cr, 0.75, 0.52, 0.99, 0.95);
+        cairo::cairo_set_line_width(cr, 1.8);
+        cairo::cairo_stroke(cr);
+    }
+
+    // 6. Date labels on bottom axis
+    cairo::cairo_set_source_rgb(cr, 0.58, 0.64, 0.72);
+    let label_step = count / 5;
+    if label_step < 1 { label_step = 1; }
+    for i in 0..count {
+        if i % label_step == 0 || i == count - 1 {
+            let cx = left_m + (f64)i * x_step;
+            cairo::cairo_move_to(cr, cx - 12.0, h - 8.0);
+            cairo::cairo_show_text(cr, &g_ts.candles[i].date_str[0]);
+        }
+    }
+
+    // 7. Interactive Hover Crosshair and Info Tooltip
+    if g_hover_idx >= 0 && g_hover_idx < count {
+        let h_idx = g_hover_idx;
+        let hx = g_hover_x;
+
+        // Vertical crosshair
+        cairo::cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.45);
+        cairo::cairo_set_line_width(cr, 1.0);
+        cairo::cairo_move_to(cr, hx, top_m);
+        cairo::cairo_line_to(cr, hx, rsi_bottom);
+        cairo::cairo_stroke(cr);
+
+        // Candle price point dot
+        let cy = price_bottom - ((g_ts.candles[h_idx].close - p_min_sc) / p_range) * price_h;
+        cairo::cairo_set_source_rgb(cr, 0.22, 0.74, 0.97);
+        cairo::cairo_arc(cr, hx, cy, 4.5, 0.0, 2.0 * PI);
+        cairo::cairo_fill_preserve(cr);
+        cairo::cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+        cairo::cairo_set_line_width(cr, 1.5);
+        cairo::cairo_stroke(cr);
+
+        // Tooltip badge at top
+        let tip: char[128];
+        if g_ind.has_sma20[h_idx] && g_ind.has_rsi14[h_idx] {
+            c_io::snprintf(
+                &tip[0],
+                128,
+                "[%s] Close: $%.2f | SMA20: $%.2f | RSI: %.1f",
+                &g_ts.candles[h_idx].date_str[0],
+                g_ts.candles[h_idx].close,
+                g_ind.sma20[h_idx],
+                g_ind.rsi14[h_idx]
+            );
+        } else {
+            c_io::snprintf(
+                &tip[0],
+                128,
+                "[%s] Close: $%.2f",
+                &g_ts.candles[h_idx].date_str[0],
+                g_ts.candles[h_idx].close
+            );
+        }
+
+        let tw: f64 = 310.0;
+        let th: f64 = 24.0;
+        let tx = hx - (tw * 0.5);
+        if tx < left_m { tx = left_m; }
+        if tx + tw > w - right_m { tx = w - right_m - tw; }
+        let ty = top_m - 22.0;
+
+        cairo::cairo_set_source_rgba(cr, 0.12, 0.16, 0.23, 0.92);
+        cairo::cairo_rectangle(cr, tx, ty, tw, th);
+        cairo::cairo_fill_preserve(cr);
+        cairo::cairo_set_source_rgba(cr, 0.22, 0.74, 0.97, 0.8);
+        cairo::cairo_set_line_width(cr, 1.0);
+        cairo::cairo_stroke(cr);
+
+        cairo::cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+        cairo::cairo_select_font_face(cr, "Sans", 0, 1);
+        cairo::cairo_set_font_size(cr, 11.0);
+        cairo::cairo_move_to(cr, tx + 10.0, ty + 16.0);
+        cairo::cairo_show_text(cr, &tip[0]);
+    }
+}
+
+raw {
+#include <gtk/gtk.h>
+#include <cairo.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+void zc_app_init(void);
+void zc_search_ticker(char *ticker);
+void zc_set_api_key(char *key);
+void zc_chart_motion(double x, double y, int width, int height);
+void zc_chart_leave(void);
+void zc_draw_chart(cairo_t *cr, int width, int height);
+
+static GtkWidget *g_win = NULL;
+static GtkWidget *g_entry_symbol = NULL;
+static GtkWidget *g_entry_key = NULL;
+static GtkWidget *g_chart_area = NULL;
+
+static GtkWidget *g_lbl_price = NULL;
+static GtkWidget *g_lbl_change = NULL;
+static GtkWidget *g_lbl_name = NULL;
+static GtkWidget *g_lbl_open = NULL;
+static GtkWidget *g_lbl_range = NULL;
+static GtkWidget *g_lbl_vol = NULL;
+
+static GtkWidget *g_badge_rec = NULL;
+static GtkWidget *g_lbl_score = NULL;
+static GtkWidget *g_lbl_conf = NULL;
+static GtkWidget *g_lbl_summary = NULL;
+static GtkWidget *g_lbl_sma_det = NULL;
+static GtkWidget *g_lbl_rsi_det = NULL;
+static GtkWidget *g_lbl_macd_det = NULL;
+static GtkWidget *g_lbl_trend_det = NULL;
+
+static GtkWidget *g_lbl_ai_status = NULL;
+static GtkWidget *g_tv_ai = NULL;
+
+static const char *APP_CSS =
+    "window.main-win { background-color: #0b1120; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }\n"
+    ".header-bar { background-color: #0f172a; border-bottom: 1px solid #1e293b; padding: 10px 18px; }\n"
+    ".app-title { font-size: 17px; font-weight: 800; color: #38bdf8; }\n"
+    ".search-entry { background-color: #1e293b; color: #f8fafc; border: 1px solid #334155; border-radius: 6px; padding: 6px 12px; font-size: 13px; font-weight: 600; }\n"
+    ".search-entry:focus { border-color: #38bdf8; }\n"
+    ".key-entry { background-color: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 6px; padding: 5px 10px; font-size: 11px; min-width: 140px; }\n"
+    "button.pill-btn { background-image: none; background-color: #1e293b; color: #cbd5e1; font-weight: 600; font-size: 12px; border-radius: 6px; padding: 5px 10px; border: 1px solid #334155; }\n"
+    "button.pill-btn:hover { background-color: #334155; color: #ffffff; }\n"
+    "button.btn-primary { background-image: none; background-color: #0284c7; color: #ffffff; font-weight: 700; font-size: 13px; border-radius: 6px; padding: 6px 14px; border: none; }\n"
+    "button.btn-primary:hover { background-color: #0ea5e9; }\n"
+    ".hud-card { background-color: #0f172a; border-bottom: 1px solid #1e293b; padding: 12px 20px; }\n"
+    ".price-big { font-size: 32px; font-weight: 800; color: #f8fafc; }\n"
+    ".name-title { font-size: 14px; font-weight: 600; color: #94a3b8; }\n"
+    ".badge-up { background-color: #064e3b; color: #34d399; font-weight: 700; font-size: 13px; border-radius: 6px; padding: 4px 10px; border: 1px solid #059669; }\n"
+    ".badge-down { background-color: #450a0a; color: #f87171; font-weight: 700; font-size: 13px; border-radius: 6px; padding: 4px 10px; border: 1px solid #dc2626; }\n"
+    ".metric-item { background-color: #1e293b; border-radius: 6px; padding: 6px 12px; border: 1px solid #334155; }\n"
+    ".metric-label { font-size: 11px; color: #94a3b8; font-weight: 600; }\n"
+    ".metric-value { font-size: 13px; color: #f8fafc; font-weight: 700; }\n"
+    ".panel-card { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; }\n"
+    ".panel-title { font-size: 13px; font-weight: 800; color: #cbd5e1; letter-spacing: 0.5px; }\n"
+    ".badge-strong-buy { background-color: #047857; color: #ffffff; font-weight: 800; font-size: 16px; border-radius: 6px; padding: 8px 16px; }\n"
+    ".badge-buy { background-color: #059669; color: #ffffff; font-weight: 800; font-size: 16px; border-radius: 6px; padding: 8px 16px; }\n"
+    ".badge-hold { background-color: #d97706; color: #ffffff; font-weight: 800; font-size: 16px; border-radius: 6px; padding: 8px 16px; }\n"
+    ".badge-sell { background-color: #ea580c; color: #ffffff; font-weight: 800; font-size: 16px; border-radius: 6px; padding: 8px 16px; }\n"
+    ".badge-strong-sell { background-color: #dc2626; color: #ffffff; font-weight: 800; font-size: 16px; border-radius: 6px; padding: 8px 16px; }\n"
+    ".breakdown-row { background-color: #1e293b; border-radius: 6px; padding: 8px 12px; margin-bottom: 6px; border-left: 3px solid #38bdf8; }\n"
+    ".breakdown-text { font-size: 12px; color: #e2e8f0; }\n"
+    ".ai-card { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; }\n"
+    ".ai-status { font-size: 11px; font-weight: 700; color: #38bdf8; background-color: #0c4a6e; padding: 3px 8px; border-radius: 4px; }\n"
+    "textview.ai-view text { background-color: #0b1120; color: #f1f5f9; font-size: 13px; font-family: monospace; }\n";
+
+static void on_search_clicked(GtkButton *b, gpointer d) {
+    (void)b; (void)d;
+    if (!g_entry_symbol) return;
+    const char *text = gtk_editable_get_text(GTK_EDITABLE(g_entry_symbol));
+    if (text && strlen(text) > 0) {
+        zc_search_ticker((char*)text);
+    }
+}
+
+static void on_pill_clicked(GtkButton *b, gpointer user_data) {
+    (void)b;
+    const char *sym = (const char*)user_data;
+    if (g_entry_symbol) {
+        gtk_editable_set_text(GTK_EDITABLE(g_entry_symbol), sym);
+    }
+    zc_search_ticker((char*)sym);
+}
+
+static void on_key_changed(GtkEditable *e, gpointer user_data) {
+    (void)user_data;
+    const char *key = gtk_editable_get_text(e);
+    zc_set_api_key((char*)key);
+}
+
+static void chart_draw_func(
+    GtkDrawingArea *area,
+    cairo_t *cr,
+    int width,
+    int height,
+    gpointer user_data
+) {
+    (void)area; (void)user_data;
+    zc_draw_chart(cr, width, height);
+}
+
+static void on_chart_motion(
+    GtkEventControllerMotion *controller,
+    double x,
+    double y,
+    gpointer user_data
+) {
+    (void)controller; (void)user_data;
+    if (g_chart_area) {
+        int w = gtk_widget_get_width(g_chart_area);
+        int h = gtk_widget_get_height(g_chart_area);
+        zc_chart_motion(x, y, w, h);
+    }
+}
+
+static void on_chart_leave(
+    GtkEventControllerMotion *controller,
+    gpointer user_data
+) {
+    (void)controller; (void)user_data;
+    zc_chart_leave();
+}
+
+void gtk_bridge_queue_chart_redraw(void) {
+    if (g_chart_area) {
+        gtk_widget_queue_draw(g_chart_area);
+    }
+}
+
+void gtk_bridge_update_ui(
+    char *sym,
+    char *name,
+    char *curr,
+    double price,
+    double change,
+    double change_pct,
+    double open,
+    double high,
+    double low,
+    double vol,
+    char *badge,
+    int score,
+    int conf,
+    int signal_type,
+    char *summary,
+    char *sma_det,
+    char *rsi_det,
+    char *macd_det,
+    char *trend_det,
+    char *ai_status,
+    char *ai_text,
+    int is_china
+) {
+    if (!g_lbl_price) return;
+
+    // Price
+    char price_buf[64];
+    if (is_china) {
+        snprintf(price_buf, sizeof(price_buf), "¥%.2f", price);
+    } else {
+        snprintf(price_buf, sizeof(price_buf), "$%.2f", price);
+    }
+    gtk_label_set_text(GTK_LABEL(g_lbl_price), price_buf);
+
+    // Change badge
+    char change_buf[64];
+    snprintf(change_buf, sizeof(change_buf), "%+.2f (%+.2f%%)", change, change_pct);
+    gtk_label_set_text(GTK_LABEL(g_lbl_change), change_buf);
+    gtk_widget_remove_css_class(g_lbl_change, "badge-up");
+    gtk_widget_remove_css_class(g_lbl_change, "badge-down");
+    if (change >= 0.0) {
+        gtk_widget_add_css_class(g_lbl_change, "badge-up");
+    } else {
+        gtk_widget_add_css_class(g_lbl_change, "badge-down");
+    }
+
+    // Name & region
+    char name_buf[128];
+    snprintf(name_buf, sizeof(name_buf), "%s (%s) · %s %s", name, sym, curr, is_china ? "· 🇨🇳 China SSE/SZSE" : "· 🇺🇸 US Market");
+    gtk_label_set_text(GTK_LABEL(g_lbl_name), name_buf);
+
+    // Metrics
+    char open_buf[32];
+    snprintf(open_buf, sizeof(open_buf), "%.2f", open);
+    gtk_label_set_text(GTK_LABEL(g_lbl_open), open_buf);
+
+    char range_buf[64];
+    snprintf(range_buf, sizeof(range_buf), "%.2f - %.2f", low, high);
+    gtk_label_set_text(GTK_LABEL(g_lbl_range), range_buf);
+
+    char vol_buf[32];
+    if (vol >= 1000000.0) {
+        snprintf(vol_buf, sizeof(vol_buf), "%.2fM", vol / 1000000.0);
+    } else if (vol >= 1000.0) {
+        snprintf(vol_buf, sizeof(vol_buf), "%.1fK", vol / 1000.0);
+    } else {
+        snprintf(vol_buf, sizeof(vol_buf), "%.0f", vol);
+    }
+    gtk_label_set_text(GTK_LABEL(g_lbl_vol), vol_buf);
+
+    // Recommendation Badge
+    gtk_label_set_text(GTK_LABEL(g_badge_rec), badge);
+    gtk_widget_remove_css_class(g_badge_rec, "badge-strong-buy");
+    gtk_widget_remove_css_class(g_badge_rec, "badge-buy");
+    gtk_widget_remove_css_class(g_badge_rec, "badge-hold");
+    gtk_widget_remove_css_class(g_badge_rec, "badge-sell");
+    gtk_widget_remove_css_class(g_badge_rec, "badge-strong-sell");
+
+    if (signal_type == 2) gtk_widget_add_css_class(g_badge_rec, "badge-strong-buy");
+    else if (signal_type == 1) gtk_widget_add_css_class(g_badge_rec, "badge-buy");
+    else if (signal_type == 0) gtk_widget_add_css_class(g_badge_rec, "badge-hold");
+    else if (signal_type == -1) gtk_widget_add_css_class(g_badge_rec, "badge-sell");
+    else gtk_widget_add_css_class(g_badge_rec, "badge-strong-sell");
+
+    // Quantitative Score
+    char score_buf[64];
+    snprintf(score_buf, sizeof(score_buf), "Score: %+d / 100", score);
+    gtk_label_set_text(GTK_LABEL(g_lbl_score), score_buf);
+
+    char conf_buf[64];
+    snprintf(conf_buf, sizeof(conf_buf), "Model Confidence: %d%%", conf);
+    gtk_label_set_text(GTK_LABEL(g_lbl_conf), conf_buf);
+
+    gtk_label_set_text(GTK_LABEL(g_lbl_summary), summary);
+    gtk_label_set_text(GTK_LABEL(g_lbl_sma_det), sma_det);
+    gtk_label_set_text(GTK_LABEL(g_lbl_rsi_det), rsi_det);
+    gtk_label_set_text(GTK_LABEL(g_lbl_macd_det), macd_det);
+    gtk_label_set_text(GTK_LABEL(g_lbl_trend_det), trend_det);
+
+    // Gemini AI narrative
+    gtk_label_set_text(GTK_LABEL(g_lbl_ai_status), ai_status);
+    if (g_tv_ai) {
+        GtkTextBuffer *tbuf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(g_tv_ai));
+        gtk_text_buffer_set_text(tbuf, ai_text, -1);
+    }
+}
+
+static void on_app_activate(GtkApplication *app, gpointer user_data) {
+    (void)user_data;
+
+    GtkCssProvider *provider = gtk_css_provider_new();
+    gtk_css_provider_load_from_string(provider, APP_CSS);
+    gtk_style_context_add_provider_for_display(
+        gdk_display_get_default(),
+        GTK_STYLE_PROVIDER(provider),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION
+    );
+
+    g_win = gtk_application_window_new(app);
+    gtk_window_set_title(GTK_WINDOW(g_win), "ZenC Stock Analysis Terminal — USA & China Real-Time Markets");
+    gtk_window_set_default_size(GTK_WINDOW(g_win), 1260, 860);
+    gtk_widget_add_css_class(g_win, "main-win");
+
+    GtkWidget *root_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_window_set_child(GTK_WINDOW(g_win), root_vbox);
+
+    /* 1. Header Bar */
+    GtkWidget *header_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_widget_add_css_class(header_bar, "header-bar");
+    gtk_box_append(GTK_BOX(root_vbox), header_bar);
+
+    GtkWidget *title_lbl = gtk_label_new("📈 ZenC Stock Analyzer");
+    gtk_widget_add_css_class(title_lbl, "app-title");
+    gtk_box_append(GTK_BOX(header_bar), title_lbl);
+
+    g_entry_symbol = gtk_entry_new();
+    gtk_widget_add_css_class(g_entry_symbol, "search-entry");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(g_entry_symbol), "Ticker (e.g. AAPL, 600519)");
+    gtk_editable_set_text(GTK_EDITABLE(g_entry_symbol), "AAPL");
+    gtk_box_append(GTK_BOX(header_bar), g_entry_symbol);
+
+    GtkWidget *btn_search = gtk_button_new_with_label("🔍 Analyze");
+    gtk_widget_add_css_class(btn_search, "btn-primary");
+    g_signal_connect(btn_search, "clicked", G_CALLBACK(on_search_clicked), NULL);
+    gtk_box_append(GTK_BOX(header_bar), btn_search);
+
+    /* Quick Preset Pills */
+    const char *pills[] = {"NVDA", "AAPL", "TSLA", "MSFT", "600519.SS", "002594.SZ"};
+    const char *pill_labels[] = {"NVDA", "AAPL", "TSLA", "MSFT", "茅台 600519", "比亚迪 002594"};
+    for (int i = 0; i < 6; i++) {
+        GtkWidget *p_btn = gtk_button_new_with_label(pill_labels[i]);
+        gtk_widget_add_css_class(p_btn, "pill-btn");
+        g_signal_connect(p_btn, "clicked", G_CALLBACK(on_pill_clicked), (gpointer)pills[i]);
+        gtk_box_append(GTK_BOX(header_bar), p_btn);
+    }
+
+    GtkWidget *spacer = gtk_label_new("");
+    gtk_widget_set_hexpand(spacer, TRUE);
+    gtk_box_append(GTK_BOX(header_bar), spacer);
+
+    GtkWidget *key_lbl = gtk_label_new("Gemini Key:");
+    gtk_widget_add_css_class(key_lbl, "metric-label");
+    gtk_box_append(GTK_BOX(header_bar), key_lbl);
+
+    g_entry_key = gtk_password_entry_new();
+    gtk_widget_add_css_class(g_entry_key, "key-entry");
+    const char *env_k = getenv("GEMINI_API_KEY");
+    if (env_k) gtk_editable_set_text(GTK_EDITABLE(g_entry_key), env_k);
+    g_signal_connect(g_entry_key, "changed", G_CALLBACK(on_key_changed), NULL);
+    gtk_box_append(GTK_BOX(header_bar), g_entry_key);
+
+    /* 2. Intraday Real-time HUD Bar */
+    GtkWidget *hud_card = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+    gtk_widget_add_css_class(hud_card, "hud-card");
+    gtk_box_append(GTK_BOX(root_vbox), hud_card);
+
+    GtkWidget *price_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    g_lbl_name = gtk_label_new("Apple Inc. (AAPL) · USD · 🇺🇸 US Market");
+    gtk_widget_add_css_class(g_lbl_name, "name-title");
+    gtk_widget_set_halign(g_lbl_name, GTK_ALIGN_START);
+
+    GtkWidget *price_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    g_lbl_price = gtk_label_new("$0.00");
+    gtk_widget_add_css_class(g_lbl_price, "price-big");
+
+    g_lbl_change = gtk_label_new("+0.00 (+0.00%)");
+    gtk_widget_add_css_class(g_lbl_change, "badge-up");
+    gtk_widget_set_valign(g_lbl_change, GTK_ALIGN_CENTER);
+
+    gtk_box_append(GTK_BOX(price_row), g_lbl_price);
+    gtk_box_append(GTK_BOX(price_row), g_lbl_change);
+    gtk_box_append(GTK_BOX(price_box), g_lbl_name);
+    gtk_box_append(GTK_BOX(price_box), price_row);
+    gtk_box_append(GTK_BOX(hud_card), price_box);
+
+    GtkWidget *hud_spacer = gtk_label_new("");
+    gtk_widget_set_hexpand(hud_spacer, TRUE);
+    gtk_box_append(GTK_BOX(hud_card), hud_spacer);
+
+    /* Metric Tiles */
+    GtkWidget *tile1 = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_add_css_class(tile1, "metric-item");
+    GtkWidget *t1_lbl = gtk_label_new("DAY OPEN");
+    gtk_widget_add_css_class(t1_lbl, "metric-label");
+    g_lbl_open = gtk_label_new("-");
+    gtk_widget_add_css_class(g_lbl_open, "metric-value");
+    gtk_box_append(GTK_BOX(tile1), t1_lbl);
+    gtk_box_append(GTK_BOX(tile1), g_lbl_open);
+    gtk_box_append(GTK_BOX(hud_card), tile1);
+
+    GtkWidget *tile2 = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_add_css_class(tile2, "metric-item");
+    GtkWidget *t2_lbl = gtk_label_new("DAY RANGE (L-H)");
+    gtk_widget_add_css_class(t2_lbl, "metric-label");
+    g_lbl_range = gtk_label_new("-");
+    gtk_widget_add_css_class(g_lbl_range, "metric-value");
+    gtk_box_append(GTK_BOX(tile2), t2_lbl);
+    gtk_box_append(GTK_BOX(tile2), g_lbl_range);
+    gtk_box_append(GTK_BOX(hud_card), tile2);
+
+    GtkWidget *tile3 = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_add_css_class(tile3, "metric-item");
+    GtkWidget *t3_lbl = gtk_label_new("VOLUME");
+    gtk_widget_add_css_class(t3_lbl, "metric-label");
+    g_lbl_vol = gtk_label_new("-");
+    gtk_widget_add_css_class(g_lbl_vol, "metric-value");
+    gtk_box_append(GTK_BOX(tile3), t3_lbl);
+    gtk_box_append(GTK_BOX(tile3), g_lbl_vol);
+    gtk_box_append(GTK_BOX(hud_card), tile3);
+
+    /* 3. Main Center Split (Left: Cairo Chart, Right: Recommendation Scorer) */
+    GtkWidget *main_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_margin_start(main_hbox, 16);
+    gtk_widget_set_margin_end(main_hbox, 16);
+    gtk_widget_set_margin_top(main_hbox, 12);
+    gtk_widget_set_margin_bottom(main_hbox, 12);
+    gtk_box_append(GTK_BOX(root_vbox), main_hbox);
+
+    /* Left: Cairo Technical Chart Drawing Area */
+    GtkWidget *chart_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_add_css_class(chart_card, "panel-card");
+    gtk_widget_set_hexpand(chart_card, TRUE);
+
+    GtkWidget *chart_title = gtk_label_new("TECHNICAL CANDLESTICK & INDICATOR TIMELINE (3-MONTH DAILY)");
+    gtk_widget_add_css_class(chart_title, "panel-title");
+    gtk_widget_set_halign(chart_title, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(chart_card), chart_title);
+
+    g_chart_area = gtk_drawing_area_new();
+    gtk_widget_set_size_request(g_chart_area, 720, 420);
+    gtk_widget_set_vexpand(g_chart_area, TRUE);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(g_chart_area), chart_draw_func, NULL, NULL);
+
+    GtkEventController *motion = gtk_event_controller_motion_new();
+    g_signal_connect(motion, "motion", G_CALLBACK(on_chart_motion), NULL);
+    g_signal_connect(motion, "leave", G_CALLBACK(on_chart_leave), NULL);
+    gtk_widget_add_controller(g_chart_area, motion);
+
+    gtk_box_append(GTK_BOX(chart_card), g_chart_area);
+    gtk_box_append(GTK_BOX(main_hbox), chart_card);
+
+    /* Right: Quantitative Recommendation Engine */
+    GtkWidget *rec_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_add_css_class(rec_card, "panel-card");
+    gtk_widget_set_size_request(rec_card, 440, -1);
+
+    GtkWidget *rec_head = gtk_label_new("QUANTITATIVE RECOMMENDATION ENGINE");
+    gtk_widget_add_css_class(rec_head, "panel-title");
+    gtk_widget_set_halign(rec_head, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(rec_card), rec_head);
+
+    g_badge_rec = gtk_label_new("ANALYZING");
+    gtk_widget_add_css_class(g_badge_rec, "badge-buy");
+    gtk_widget_set_margin_top(g_badge_rec, 4);
+    gtk_widget_set_margin_bottom(g_badge_rec, 4);
+    gtk_box_append(GTK_BOX(rec_card), g_badge_rec);
+
+    GtkWidget *score_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    g_lbl_score = gtk_label_new("Score: +0 / 100");
+    gtk_widget_add_css_class(g_lbl_score, "metric-value");
+    g_lbl_conf = gtk_label_new("Confidence: 0%");
+    gtk_widget_add_css_class(g_lbl_conf, "metric-label");
+    gtk_box_append(GTK_BOX(score_row), g_lbl_score);
+    gtk_box_append(GTK_BOX(score_row), g_lbl_conf);
+    gtk_box_append(GTK_BOX(rec_card), score_row);
+
+    g_lbl_summary = gtk_label_new("Calculating multi-indicator algorithmic consensus...");
+    gtk_widget_add_css_class(g_lbl_summary, "breakdown-text");
+    gtk_label_set_wrap(GTK_LABEL(g_lbl_summary), TRUE);
+    gtk_widget_set_margin_bottom(g_lbl_summary, 6);
+    gtk_box_append(GTK_BOX(rec_card), g_lbl_summary);
+
+    /* Indicator Breakdown Items */
+    GtkWidget *b1 = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_add_css_class(b1, "breakdown-row");
+    GtkWidget *t_b1 = gtk_label_new("● 20-DAY SMA TREND");
+    gtk_widget_add_css_class(t_b1, "metric-label");
+    gtk_widget_set_halign(t_b1, GTK_ALIGN_START);
+    g_lbl_sma_det = gtk_label_new("-");
+    gtk_widget_add_css_class(g_lbl_sma_det, "breakdown-text");
+    gtk_label_set_wrap(GTK_LABEL(g_lbl_sma_det), TRUE);
+    gtk_box_append(GTK_BOX(b1), t_b1);
+    gtk_box_append(GTK_BOX(b1), g_lbl_sma_det);
+    gtk_box_append(GTK_BOX(rec_card), b1);
+
+    GtkWidget *b2 = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_add_css_class(b2, "breakdown-row");
+    GtkWidget *t_b2 = gtk_label_new("● 14-DAY RSI MOMENTUM");
+    gtk_widget_add_css_class(t_b2, "metric-label");
+    gtk_widget_set_halign(t_b2, GTK_ALIGN_START);
+    g_lbl_rsi_det = gtk_label_new("-");
+    gtk_widget_add_css_class(g_lbl_rsi_det, "breakdown-text");
+    gtk_label_set_wrap(GTK_LABEL(g_lbl_rsi_det), TRUE);
+    gtk_box_append(GTK_BOX(b2), t_b2);
+    gtk_box_append(GTK_BOX(b2), g_lbl_rsi_det);
+    gtk_box_append(GTK_BOX(rec_card), b2);
+
+    GtkWidget *b3 = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_add_css_class(b3, "breakdown-row");
+    GtkWidget *t_b3 = gtk_label_new("● MACD (12, 26, 9) CROSSOVER");
+    gtk_widget_add_css_class(t_b3, "metric-label");
+    gtk_widget_set_halign(t_b3, GTK_ALIGN_START);
+    g_lbl_macd_det = gtk_label_new("-");
+    gtk_widget_add_css_class(g_lbl_macd_det, "breakdown-text");
+    gtk_label_set_wrap(GTK_LABEL(g_lbl_macd_det), TRUE);
+    gtk_box_append(GTK_BOX(b3), t_b3);
+    gtk_box_append(GTK_BOX(b3), g_lbl_macd_det);
+    gtk_box_append(GTK_BOX(rec_card), b3);
+
+    GtkWidget *b4 = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_add_css_class(b4, "breakdown-row");
+    GtkWidget *t_b4 = gtk_label_new("● INTRADAY SESSION FLOW");
+    gtk_widget_add_css_class(t_b4, "metric-label");
+    gtk_widget_set_halign(t_b4, GTK_ALIGN_START);
+    g_lbl_trend_det = gtk_label_new("-");
+    gtk_widget_add_css_class(g_lbl_trend_det, "breakdown-text");
+    gtk_label_set_wrap(GTK_LABEL(g_lbl_trend_det), TRUE);
+    gtk_box_append(GTK_BOX(b4), t_b4);
+    gtk_box_append(GTK_BOX(b4), g_lbl_trend_det);
+    gtk_box_append(GTK_BOX(rec_card), b4);
+
+    gtk_box_append(GTK_BOX(main_hbox), rec_card);
+
+    /* 4. Bottom Section: Google Gemini 1.5 AI Financial Analysis */
+    GtkWidget *ai_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_add_css_class(ai_card, "ai-card");
+    gtk_widget_set_margin_start(ai_card, 16);
+    gtk_widget_set_margin_end(ai_card, 16);
+    gtk_widget_set_margin_bottom(ai_card, 16);
+    gtk_box_append(GTK_BOX(root_vbox), ai_card);
+
+    GtkWidget *ai_head_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    GtkWidget *ai_title = gtk_label_new("✨ GOOGLE GEMINI 1.5 FLASH FINANCIAL RESEARCH & RISK REPORT");
+    gtk_widget_add_css_class(ai_title, "panel-title");
+    gtk_box_append(GTK_BOX(ai_head_row), ai_title);
+
+    g_lbl_ai_status = gtk_label_new("Connecting...");
+    gtk_widget_add_css_class(g_lbl_ai_status, "ai-status");
+    gtk_box_append(GTK_BOX(ai_head_row), g_lbl_ai_status);
+    gtk_box_append(GTK_BOX(ai_card), ai_head_row);
+
+    GtkWidget *scroll = gtk_scrolled_window_new();
+    gtk_widget_set_size_request(scroll, -1, 140);
+    gtk_widget_set_vexpand(scroll, FALSE);
+
+    g_tv_ai = gtk_text_view_new();
+    gtk_widget_add_css_class(g_tv_ai, "ai-view");
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(g_tv_ai), FALSE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(g_tv_ai), GTK_WRAP_WORD_CHAR);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(g_tv_ai), 10);
+    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(g_tv_ai), 10);
+    gtk_text_view_set_top_margin(GTK_TEXT_VIEW(g_tv_ai), 8);
+    gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(g_tv_ai), 8);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), g_tv_ai);
+    gtk_box_append(GTK_BOX(ai_card), scroll);
+
+    gtk_window_present(GTK_WINDOW(g_win));
+
+    // Initialize Zen C app logic
+    zc_app_init();
+}
+
+int main(int argc, char **argv) {
+    GtkApplication *app = gtk_application_new("com.antigravity.stockanalyzer", G_APPLICATION_DEFAULT_FLAGS);
+    g_signal_connect(app, "activate", G_CALLBACK(on_app_activate), NULL);
+    int status = g_application_run(G_APPLICATION(app), argc, argv);
+    g_object_unref(app);
+    return status;
+}
+}

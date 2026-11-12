@@ -1,0 +1,131 @@
+// Unit tests for Stock Analyzer Indicators & Recommendation Engine in Zen C
+// Run: zc run tests.zc
+
+import "model.zc";
+import "indicators.zc";
+import "stdio.h" as c_io;
+
+fn test_sma_calculation() {
+    let ts: Timeseries;
+    ts.count = 25;
+    for i in 0..25 {
+        ts.candles[i].close = 10.0 + (f64)i; // 10.0, 11.0, ..., 34.0
+    }
+
+    let ind: IndicatorResult;
+    compute_sma(&ts, 20, &ind);
+
+    assert(ind.has_sma20[18] == false, "SMA-20 should not be ready before index 19");
+    assert(ind.has_sma20[19] == true, "SMA-20 should be ready at index 19");
+
+    // At index 19, values are 10..29 -> average is (10+29)/2 = 19.5
+    let diff = ind.sma20[19] - 19.5;
+    if diff < 0.0 { diff = -diff; }
+    assert(diff < 0.001, "SMA-20 at index 19 must equal 19.5");
+
+    // At index 24 (latest), values are 15..34 -> average is (15+34)/2 = 24.5
+    let diff_latest = ind.latest_sma20 - 24.5;
+    if diff_latest < 0.0 { diff_latest = -diff_latest; }
+    assert(diff_latest < 0.001, "Latest SMA-20 must equal 24.5");
+
+    println "  [PASS] test_sma_calculation";
+}
+
+fn test_rsi_calculation() {
+    let ts: Timeseries;
+    ts.count = 20;
+
+    // Constantly climbing series: all gains, 0 losses
+    for i in 0..20 {
+        ts.candles[i].close = 100.0 + (f64)i * 2.0;
+    }
+
+    let ind: IndicatorResult;
+    compute_rsi(&ts, 14, &ind);
+
+    assert(ind.has_rsi14[14] == true, "RSI-14 must be ready at index 14");
+    assert(ind.latest_rsi14 > 99.0, "RSI for monotonic climbing series must approach 100");
+
+    // Falling series: all losses, 0 gains
+    let ts_falling: Timeseries;
+    ts_falling.count = 20;
+    for i in 0..20 {
+        ts_falling.candles[i].close = 200.0 - (f64)i * 3.0;
+    }
+
+    let ind_falling: IndicatorResult;
+    compute_rsi(&ts_falling, 14, &ind_falling);
+    assert(ind_falling.latest_rsi14 < 1.0, "RSI for monotonic falling series must approach 0");
+
+    println "  [PASS] test_rsi_calculation";
+}
+
+fn test_macd_calculation() {
+    let ts: Timeseries;
+    ts.count = 40;
+    for i in 0..40 {
+        ts.candles[i].close = 50.0 + (f64)i * 1.5;
+    }
+
+    let ind: IndicatorResult;
+    compute_macd(&ts, &ind);
+
+    assert(ind.has_macd[30] == true, "MACD must be valid past index 26");
+    // With rising prices, fast EMA12 > slow EMA26 -> MACD line should be positive
+    assert(ind.latest_macd > 0.0, "MACD line must be positive during consistent upward trend");
+
+    println "  [PASS] test_macd_calculation";
+}
+
+fn test_recommendation_scoring() {
+    let quote: StockQuote;
+    c_io::snprintf(&quote.symbol[0], 32, "AAPL");
+    quote.current_price = 220.0;
+    quote.change_pct = 2.5;
+
+    let ts: Timeseries;
+    ts.count = 30;
+
+    let ind: IndicatorResult;
+    ind.latest_sma20 = 200.0;     // Price 220 > SMA 200 (bullish: +35 pts)
+    ind.latest_rsi14 = 42.0;      // Value zone (bullish: +15 pts)
+    ind.latest_macd = 4.5;
+    ind.latest_macd_signal = 3.0;
+    ind.latest_macd_hist = 1.5;   // Bullish crossover (+25 pts)
+    // Day change +2.5% (+15 pts)
+    // Expected score >= +50 -> STRONG BUY
+
+    let rec: Recommendation;
+    evaluate_recommendation(&quote, &ts, &ind, &rec);
+
+    assert(rec.signal == SIGNAL_STRONG_BUY, "Favorable multi-indicator alignment should yield STRONG BUY");
+    assert(rec.score >= 50, "Bullish score should be >= 50");
+    assert(rec.confidence >= 70, "Confidence should be >= 70 percent");
+
+    // Bearish case
+    quote.current_price = 170.0;
+    quote.change_pct = -3.2;
+    ind.latest_sma20 = 195.0;     // Price 170 < SMA 195 (bearish: -35 pts)
+    ind.latest_rsi14 = 75.0;      // Overbought / divergence exhaustion (-30 pts)
+    ind.latest_macd = -2.5;
+    ind.latest_macd_signal = -1.0;
+    ind.latest_macd_hist = -1.5;  // Bearish crossover (-25 pts)
+    // Day change -3.2% (-15 pts)
+
+    let rec_bear: Recommendation;
+    evaluate_recommendation(&quote, &ts, &ind, &rec_bear);
+
+    assert(rec_bear.signal == SIGNAL_STRONG_SELL, "Negative multi-indicator alignment should yield STRONG SELL");
+    assert(rec_bear.score <= -50, "Bearish score should be <= -50");
+
+    println "  [PASS] test_recommendation_scoring";
+}
+
+fn main() {
+    println "Running Stock Analyzer Unit Tests in Zen C...";
+    test_sma_calculation();
+    test_rsi_calculation();
+    test_macd_calculation();
+    test_recommendation_scoring();
+    println "All tests passed successfully!";
+}

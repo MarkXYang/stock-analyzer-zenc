@@ -1,0 +1,4 @@
+stock-analyzer
+tests
+*.o
+*.c
