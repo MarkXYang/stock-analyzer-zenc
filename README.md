@@ -27,12 +27,18 @@ A high-performance native desktop stock market technical analysis and AI researc
     - `★ STRONG SELL ★` ($\le -50$)
   - Model confidence estimation ($55\%$ to $92\%$).
   - Full transparent factor attribution breakdown.
-- **Cairo Interactive Technical Charting**:
-  - Smooth price curve with glowing cyan fill gradient.
+- **Cairo Interactive Technical Charting & K-Diagram**:
+  - **Full K-Line (Candlestick / K线图) Diagram**:
+    - High/Low upper and lower shadow wicks.
+    - Bullish and bearish real body boxes.
+    - **Market-Aware Color Schemes**:
+      - **China A-Shares (SSE/SZSE)**: Red is Bullish (阳线), Green is Bearish (阴线).
+      - **US / International**: Green is Bullish, Red is Bearish.
+    - **One-Click Mode Switcher**: Instant toggle between `🕯 K-Line` (Candlestick) and `📈 Line` (Continuous area curve).
   - Amber SMA-20 overlay.
   - Green/Red volume histogram aligned with daily price bars.
   - RSI-14 oscillator sub-panel with dashed 70/30 threshold bands.
-  - Interactive mouse hover crosshair with date and price tooltip HUD.
+  - Interactive mouse hover crosshair with complete **OHLC (Open, High, Low, Close)** and indicator tooltip HUD.
 - **Google Gemini 1.5 Flash AI Research Note**:
   - Ingests the technical indicator vectors and produces a structured Wall Street-grade equity note:
     1. Trend & Momentum Posture
