@@ -1,5 +1,5 @@
 // Stock Analyzer — Native Desktop Application in Zen C + GTK4 + Cairo + Gemini
-// Supports USA & China Stock Markets, Technical Indicators, and AI Research
+// Supports USA & China Stock Markets, Technical Indicators, K-Diagram (Candlesticks), and AI Research
 // Build: zc build main.zc -o stock-analyzer
 // Run:   zc run main.zc
 
@@ -27,6 +27,7 @@ let g_rec: Recommendation;
 let g_analysis: GeminiAnalysis;
 let g_gemini_key: char[128];
 
+let g_chart_mode: int = 0; // 0 = Candlesticks (K-Line / K线图), 1 = Line Chart (分时折线)
 let g_hover_idx: int = -1;
 let g_hover_x: f64 = 0.0;
 let g_hover_y: f64 = 0.0;
@@ -57,6 +58,7 @@ extern fn gtk_bridge_update_ui(
 );
 
 extern fn gtk_bridge_queue_chart_redraw();
+extern fn gtk_bridge_update_mode_button(mode: int);
 
 fn refresh_analysis(ticker: char*) {
     let ok = fetch_stock_data(ticker, &g_quote, &g_ts);
@@ -116,6 +118,17 @@ fn zc_search_ticker(ticker: char*) {
     if ticker != NULL && ticker[0] != '\0' {
         refresh_analysis(ticker);
     }
+}
+
+@export
+fn zc_toggle_chart_mode() {
+    if g_chart_mode == 0 {
+        g_chart_mode = 1;
+    } else {
+        g_chart_mode = 0;
+    }
+    gtk_bridge_update_mode_button(g_chart_mode);
+    gtk_bridge_queue_chart_redraw();
 }
 
 @export
@@ -266,36 +279,98 @@ fn zc_draw_chart(cr: cairo::cairo_t*, width: int, height: int) {
 
     let x_step = chart_w / (f64)(count - 1);
 
-    // 2. Draw Price Line & Gradient Area Fill
-    // Fill path
-    cairo::cairo_new_path(cr);
-    cairo::cairo_move_to(cr, left_m, price_bottom);
-    for i in 0..count {
-        let cx = left_m + (f64)i * x_step;
-        let cy = price_bottom - ((g_ts.candles[i].close - p_min_sc) / p_range) * price_h;
-        cairo::cairo_line_to(cr, cx, cy);
-    }
-    cairo::cairo_line_to(cr, left_m + (f64)(count - 1) * x_step, price_bottom);
-    cairo::cairo_close_path(cr);
+    // 2. Render K-Diagram (Candlesticks) OR Line Chart
+    if g_chart_mode == 0 {
+        // --- K-LINE / CANDLESTICK RENDERING ---
+        let candle_w = x_step * 0.72;
+        if candle_w < 3.0 { candle_w = 3.0; }
+        if candle_w > 16.0 { candle_w = 16.0; }
 
-    // Cyan area wash
-    cairo::cairo_set_source_rgba(cr, 0.22, 0.74, 0.97, 0.16);
-    cairo::cairo_fill(cr);
+        for i in 0..count {
+            let cx = left_m + (f64)i * x_step;
+            let c_open = g_ts.candles[i].open;
+            let c_high = g_ts.candles[i].high;
+            let c_low = g_ts.candles[i].low;
+            let c_close = g_ts.candles[i].close;
 
-    // Price stroke
-    cairo::cairo_new_path(cr);
-    for i in 0..count {
-        let cx = left_m + (f64)i * x_step;
-        let cy = price_bottom - ((g_ts.candles[i].close - p_min_sc) / p_range) * price_h;
-        if i == 0 {
-            cairo::cairo_move_to(cr, cx, cy);
-        } else {
+            let y_high = price_bottom - ((c_high - p_min_sc) / p_range) * price_h;
+            let y_low = price_bottom - ((c_low - p_min_sc) / p_range) * price_h;
+            let y_o = price_bottom - ((c_open - p_min_sc) / p_range) * price_h;
+            let y_c = price_bottom - ((c_close - p_min_sc) / p_range) * price_h;
+
+            let y_top = if y_o < y_c { y_o } else { y_c };
+            let y_bot = if y_o > y_c { y_o } else { y_c };
+            let body_h = y_bot - y_top;
+            if body_h < 1.8 { body_h = 1.8; }
+
+            let is_bullish = c_close >= c_open;
+
+            // Color scheme by market:
+            // China SSE/SZSE: Red is Bullish (阳线), Green is Bearish (阴线)
+            // US/Global: Green is Bullish, Red is Bearish
+            let cr_r: f64 = 0.0;
+            let cr_g: f64 = 0.0;
+            let cr_b: f64 = 0.0;
+            if g_quote.is_china {
+                if is_bullish {
+                    cr_r = 0.937; cr_g = 0.267; cr_b = 0.267; // Red
+                } else {
+                    cr_r = 0.063; cr_g = 0.725; cr_b = 0.506; // Green
+                }
+            } else {
+                if is_bullish {
+                    cr_r = 0.063; cr_g = 0.725; cr_b = 0.506; // Green
+                } else {
+                    cr_r = 0.937; cr_g = 0.267; cr_b = 0.267; // Red
+                }
+            }
+
+            // High/Low Wick (Shadow line)
+            cairo::cairo_set_source_rgba(cr, cr_r, cr_g, cr_b, 0.85);
+            cairo::cairo_set_line_width(cr, 1.2);
+            cairo::cairo_move_to(cr, cx, y_high);
+            cairo::cairo_line_to(cr, cx, y_low);
+            cairo::cairo_stroke(cr);
+
+            // Real Body Rectangle
+            let bx = cx - (candle_w * 0.5);
+            cairo::cairo_rectangle(cr, bx, y_top, candle_w, body_h);
+            cairo::cairo_set_source_rgba(cr, cr_r, cr_g, cr_b, 0.92);
+            cairo::cairo_fill_preserve(cr);
+            cairo::cairo_set_source_rgba(cr, cr_r, cr_g, cr_b, 1.0);
+            cairo::cairo_set_line_width(cr, 0.8);
+            cairo::cairo_stroke(cr);
+        }
+    } else {
+        // --- LINE CHART WITH GRADIENT WASH ---
+        cairo::cairo_new_path(cr);
+        cairo::cairo_move_to(cr, left_m, price_bottom);
+        for i in 0..count {
+            let cx = left_m + (f64)i * x_step;
+            let cy = price_bottom - ((g_ts.candles[i].close - p_min_sc) / p_range) * price_h;
             cairo::cairo_line_to(cr, cx, cy);
         }
+        cairo::cairo_line_to(cr, left_m + (f64)(count - 1) * x_step, price_bottom);
+        cairo::cairo_close_path(cr);
+
+        cairo::cairo_set_source_rgba(cr, 0.22, 0.74, 0.97, 0.16);
+        cairo::cairo_fill(cr);
+
+        // Price stroke
+        cairo::cairo_new_path(cr);
+        for i in 0..count {
+            let cx = left_m + (f64)i * x_step;
+            let cy = price_bottom - ((g_ts.candles[i].close - p_min_sc) / p_range) * price_h;
+            if i == 0 {
+                cairo::cairo_move_to(cr, cx, cy);
+            } else {
+                cairo::cairo_line_to(cr, cx, cy);
+            }
+        }
+        cairo::cairo_set_source_rgba(cr, 0.22, 0.74, 0.97, 0.95);
+        cairo::cairo_set_line_width(cr, 2.0);
+        cairo::cairo_stroke(cr);
     }
-    cairo::cairo_set_source_rgba(cr, 0.22, 0.74, 0.97, 0.95);
-    cairo::cairo_set_line_width(cr, 2.0);
-    cairo::cairo_stroke(cr);
 
     // 3. Draw 20-day Simple Moving Average (SMA-20 in Amber)
     let first_sma = true;
@@ -322,20 +397,39 @@ fn zc_draw_chart(cr: cairo::cairo_t*, width: int, height: int) {
     cairo::cairo_select_font_face(cr, "Sans", 0, 1);
     cairo::cairo_set_font_size(cr, 10.5);
 
-    // Cyan Close Pill
-    cairo::cairo_set_source_rgb(cr, 0.22, 0.74, 0.97);
-    cairo::cairo_arc(cr, left_m + 6.0, top_m - 12.0, 4.0, 0.0, 2.0 * PI);
-    cairo::cairo_fill(cr);
-    cairo::cairo_set_source_rgb(cr, 0.88, 0.91, 0.94);
-    cairo::cairo_move_to(cr, left_m + 14.0, top_m - 8.5);
-    cairo::cairo_show_text(cr, "Close Price");
+    if g_chart_mode == 0 {
+        // Candlestick indicator legend
+        cairo::cairo_set_source_rgb(cr, 0.063, 0.725, 0.506);
+        cairo::cairo_rectangle(cr, left_m + 6.0, top_m - 16.0, 7.0, 10.0);
+        cairo::cairo_fill(cr);
+        cairo::cairo_set_source_rgb(cr, 0.937, 0.267, 0.267);
+        cairo::cairo_rectangle(cr, left_m + 15.0, top_m - 16.0, 7.0, 10.0);
+        cairo::cairo_fill(cr);
+
+        cairo::cairo_set_source_rgb(cr, 0.88, 0.91, 0.94);
+        cairo::cairo_move_to(cr, left_m + 26.0, top_m - 8.5);
+        if g_quote.is_china {
+            cairo::cairo_show_text(cr, "K-Line (红涨/绿跌)");
+        } else {
+            cairo::cairo_show_text(cr, "Candlestick K-Line");
+        }
+    } else {
+        // Line Close Pill
+        cairo::cairo_set_source_rgb(cr, 0.22, 0.74, 0.97);
+        cairo::cairo_arc(cr, left_m + 6.0, top_m - 12.0, 4.0, 0.0, 2.0 * PI);
+        cairo::cairo_fill(cr);
+        cairo::cairo_set_source_rgb(cr, 0.88, 0.91, 0.94);
+        cairo::cairo_move_to(cr, left_m + 14.0, top_m - 8.5);
+        cairo::cairo_show_text(cr, "Close Price Line");
+    }
 
     // Amber SMA-20 Pill
+    let sma_legend_x = left_m + (if g_chart_mode == 0 { 150.0 } else { 120.0 });
     cairo::cairo_set_source_rgb(cr, 0.96, 0.62, 0.04);
-    cairo::cairo_arc(cr, left_m + 95.0, top_m - 12.0, 4.0, 0.0, 2.0 * PI);
+    cairo::cairo_arc(cr, sma_legend_x, top_m - 12.0, 4.0, 0.0, 2.0 * PI);
     cairo::cairo_fill(cr);
     cairo::cairo_set_source_rgb(cr, 0.88, 0.91, 0.94);
-    cairo::cairo_move_to(cr, left_m + 103.0, top_m - 8.5);
+    cairo::cairo_move_to(cr, sma_legend_x + 8.0, top_m - 8.5);
     cairo::cairo_show_text(cr, "SMA-20");
 
     // 4. Draw Volume Bars
@@ -362,10 +456,19 @@ fn zc_draw_chart(cr: cairo::cairo_t*, width: int, height: int) {
         let bx = left_m + (f64)i * x_step - (bar_w * 0.5);
         let by = vol_bottom - bh;
 
-        if g_ts.candles[i].close >= g_ts.candles[i].open {
-            cairo::cairo_set_source_rgba(cr, 0.063, 0.725, 0.506, 0.65); // Emerald Green
+        let is_up = g_ts.candles[i].close >= g_ts.candles[i].open;
+        if g_quote.is_china {
+            if is_up {
+                cairo::cairo_set_source_rgba(cr, 0.937, 0.267, 0.267, 0.65); // Red in China
+            } else {
+                cairo::cairo_set_source_rgba(cr, 0.063, 0.725, 0.506, 0.65); // Green in China
+            }
         } else {
-            cairo::cairo_set_source_rgba(cr, 0.937, 0.267, 0.267, 0.65); // Rose Red
+            if is_up {
+                cairo::cairo_set_source_rgba(cr, 0.063, 0.725, 0.506, 0.65); // Green in US
+            } else {
+                cairo::cairo_set_source_rgba(cr, 0.937, 0.267, 0.267, 0.65); // Red in US
+            }
         }
         cairo::cairo_rectangle(cr, bx, by, bar_w, bh);
         cairo::cairo_fill(cr);
@@ -439,7 +542,7 @@ fn zc_draw_chart(cr: cairo::cairo_t*, width: int, height: int) {
         }
     }
 
-    // 7. Interactive Hover Crosshair and Info Tooltip
+    // 7. Interactive Hover Crosshair and Complete OHLC Info Tooltip
     if g_hover_idx >= 0 && g_hover_idx < count {
         let h_idx = g_hover_idx;
         let hx = g_hover_x;
@@ -460,29 +563,36 @@ fn zc_draw_chart(cr: cairo::cairo_t*, width: int, height: int) {
         cairo::cairo_set_line_width(cr, 1.5);
         cairo::cairo_stroke(cr);
 
-        // Tooltip badge at top
-        let tip: char[128];
+        // Tooltip badge showing OHLC (Open, High, Low, Close) + Indicators
+        let tip: char[160];
+        let c = &g_ts.candles[h_idx];
         if g_ind.has_sma20[h_idx] && g_ind.has_rsi14[h_idx] {
             c_io::snprintf(
                 &tip[0],
-                128,
-                "[%s] Close: $%.2f | SMA20: $%.2f | RSI: %.1f",
-                &g_ts.candles[h_idx].date_str[0],
-                g_ts.candles[h_idx].close,
+                160,
+                "[%s] O:%.2f H:%.2f L:%.2f C:%.2f | SMA20:%.2f | RSI:%.1f",
+                &c.date_str[0],
+                c.open,
+                c.high,
+                c.low,
+                c.close,
                 g_ind.sma20[h_idx],
                 g_ind.rsi14[h_idx]
             );
         } else {
             c_io::snprintf(
                 &tip[0],
-                128,
-                "[%s] Close: $%.2f",
-                &g_ts.candles[h_idx].date_str[0],
-                g_ts.candles[h_idx].close
+                160,
+                "[%s] O:%.2f H:%.2f L:%.2f C:%.2f",
+                &c.date_str[0],
+                c.open,
+                c.high,
+                c.low,
+                c.close
             );
         }
 
-        let tw: f64 = 310.0;
+        let tw: f64 = 390.0;
         let th: f64 = 24.0;
         let tx = hx - (tw * 0.5);
         if tx < left_m { tx = left_m; }
@@ -514,6 +624,7 @@ raw {
 void zc_app_init(void);
 void zc_search_ticker(char *ticker);
 void zc_set_api_key(char *key);
+void zc_toggle_chart_mode(void);
 void zc_chart_motion(double x, double y, int width, int height);
 void zc_chart_leave(void);
 void zc_draw_chart(cairo_t *cr, int width, int height);
@@ -522,6 +633,7 @@ static GtkWidget *g_win = NULL;
 static GtkWidget *g_entry_symbol = NULL;
 static GtkWidget *g_entry_key = NULL;
 static GtkWidget *g_chart_area = NULL;
+static GtkWidget *g_btn_chart_mode = NULL;
 
 static GtkWidget *g_lbl_price = NULL;
 static GtkWidget *g_lbl_change = NULL;
@@ -592,6 +704,11 @@ static void on_pill_clicked(GtkButton *b, gpointer user_data) {
     zc_search_ticker((char*)sym);
 }
 
+static void on_mode_toggle_clicked(GtkButton *b, gpointer user_data) {
+    (void)b; (void)user_data;
+    zc_toggle_chart_mode();
+}
+
 static void on_key_changed(GtkEditable *e, gpointer user_data) {
     (void)user_data;
     const char *key = gtk_editable_get_text(e);
@@ -634,6 +751,16 @@ static void on_chart_leave(
 void gtk_bridge_queue_chart_redraw(void) {
     if (g_chart_area) {
         gtk_widget_queue_draw(g_chart_area);
+    }
+}
+
+void gtk_bridge_update_mode_button(int mode) {
+    if (g_btn_chart_mode) {
+        if (mode == 0) {
+            gtk_button_set_label(GTK_BUTTON(g_btn_chart_mode), "🕯 K-Line (Active)");
+        } else {
+            gtk_button_set_label(GTK_BUTTON(g_btn_chart_mode), "📈 Line (Active)");
+        }
     }
 }
 
@@ -881,10 +1008,21 @@ static void on_app_activate(GtkApplication *app, gpointer user_data) {
     gtk_widget_add_css_class(chart_card, "panel-card");
     gtk_widget_set_hexpand(chart_card, TRUE);
 
-    GtkWidget *chart_title = gtk_label_new("TECHNICAL CANDLESTICK & INDICATOR TIMELINE (3-MONTH DAILY)");
+    GtkWidget *chart_head_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *chart_title = gtk_label_new("TECHNICAL K-DIAGRAM (CANDLESTICKS) & INDICATORS");
     gtk_widget_add_css_class(chart_title, "panel-title");
-    gtk_widget_set_halign(chart_title, GTK_ALIGN_START);
-    gtk_box_append(GTK_BOX(chart_card), chart_title);
+    gtk_box_append(GTK_BOX(chart_head_row), chart_title);
+
+    GtkWidget *mode_spacer = gtk_label_new("");
+    gtk_widget_set_hexpand(mode_spacer, TRUE);
+    gtk_box_append(GTK_BOX(chart_head_row), mode_spacer);
+
+    g_btn_chart_mode = gtk_button_new_with_label("🕯 K-Line (Active)");
+    gtk_widget_add_css_class(g_btn_chart_mode, "pill-btn");
+    g_signal_connect(g_btn_chart_mode, "clicked", G_CALLBACK(on_mode_toggle_clicked), NULL);
+    gtk_box_append(GTK_BOX(chart_head_row), g_btn_chart_mode);
+
+    gtk_box_append(GTK_BOX(chart_card), chart_head_row);
 
     g_chart_area = gtk_drawing_area_new();
     gtk_widget_set_size_request(g_chart_area, 720, 420);
